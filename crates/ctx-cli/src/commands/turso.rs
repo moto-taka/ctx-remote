@@ -16,6 +16,7 @@ const MAX_PUSH_BATCH_SIZE: usize = 250;
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 200;
 const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_PROJECTION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug, Args)]
 pub(crate) struct TursoArgs {
@@ -29,6 +30,7 @@ impl TursoArgs {
             TursoCommand::Init(args) => args.json,
             TursoCommand::Push(args) => args.json,
             TursoCommand::Import(args) => args.json,
+            TursoCommand::Project(args) => args.json,
             TursoCommand::Search(args) => args.json,
             TursoCommand::Status(args) => args.json,
         }
@@ -45,6 +47,8 @@ enum TursoCommand {
         about = "Import all discovered provider histories directly into Turso without a local SQLite file"
     )]
     Import(TursoImportArgs),
+    #[command(about = "Build the remote search projection from an imported ctx SQLite snapshot")]
+    Project(TursoProjectArgs),
     #[command(about = "Search history stored in Turso")]
     Search(TursoSearchArgs),
     #[command(about = "Show Turso ctx projection status")]
@@ -91,6 +95,16 @@ struct TursoImportArgs {
         help = "Number of events per remote transaction (1-250)"
     )]
     batch_size: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TursoProjectArgs {
+    #[arg(long, default_value_t = DEFAULT_PUSH_BATCH_SIZE, value_parser = parse_push_batch_size)]
+    batch_size: usize,
+    #[arg(long)]
+    limit: Option<usize>,
     #[arg(long)]
     json: bool,
 }
@@ -162,6 +176,7 @@ pub(crate) fn run_turso(args: TursoArgs, data_root: PathBuf) -> Result<()> {
             print_push_report(&report, json_output)
         }
         TursoCommand::Import(args) => run_turso_import(args),
+        TursoCommand::Project(args) => run_async(project(args)),
         TursoCommand::Search(args) => run_async(search(args)),
         TursoCommand::Status(args) => run_async(status(args.json)),
     }
@@ -261,6 +276,12 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<()> {
     .await
     .context("create Turso event time index")?;
     conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS ctx_turso_search USING fts5(event_id UNINDEXED, search_text)",
+        (),
+    )
+    .await
+    .context("create Turso full-text search index")?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS ctx_turso_events_provider \
          ON ctx_turso_events(provider)",
         (),
@@ -275,6 +296,73 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<()> {
     .await
     .context("create Turso dedupe index")?;
     Ok(())
+}
+
+async fn project(args: TursoProjectArgs) -> Result<()> {
+    let conn = connect().await?;
+    if !has_imported_snapshot(&conn).await? {
+        return Err(anyhow!(
+            "ctx turso project requires an imported ctx SQLite snapshot"
+        ));
+    }
+    ensure_schema(&conn).await?;
+    let mut projected = 0usize;
+    loop {
+        if args.limit.is_some_and(|limit| projected >= limit) {
+            break;
+        }
+        let after = remote_max_event_id(&conn).await?;
+        let predicate = after
+            .as_ref()
+            .map(|id| format!("AND e.id > {}", sql_text_literal(id)))
+            .unwrap_or_default();
+        let search_predicate = after
+            .as_ref()
+            .map(|id| format!("WHERE event_id > {}", sql_text_literal(id)))
+            .unwrap_or_default();
+        let sql = format!("INSERT OR IGNORE INTO ctx_turso_events \
+        (event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json, search_text) \
+        SELECT e.id, e.session_id, COALESCE(s.provider, 'unknown'), e.role, e.event_type, e.occurred_at_ms, e.payload_json, e.payload_json \
+        FROM events e LEFT JOIN sessions s ON s.id = e.session_id \
+        WHERE e.deleted_at_ms IS NULL {predicate} ORDER BY e.id LIMIT {}; \
+        INSERT INTO ctx_turso_search(event_id, search_text) \
+        SELECT event_id, search_text FROM ctx_turso_events {search_predicate} ORDER BY event_id LIMIT {};", args.batch_size, args.batch_size);
+        tokio::time::timeout(
+            REMOTE_PROJECTION_TIMEOUT,
+            conn.execute_transactional_batch(&sql),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "build Turso search projection timed out after {} seconds",
+                REMOTE_PROJECTION_TIMEOUT.as_secs()
+            )
+        })?
+        .context("build Turso search projection")?;
+        let next = remote_max_event_id(&conn).await?;
+        if next == after {
+            break;
+        }
+        projected += args.batch_size;
+    }
+    if args.json {
+        print_json(json!({"projected": true, "remote_primary": true}))?;
+    } else {
+        println!("Turso search projection is ready.");
+    }
+    Ok(())
+}
+
+async fn remote_max_event_id(conn: &libsql::Connection) -> Result<Option<String>> {
+    let mut rows = conn
+        .query("SELECT MAX(event_id) FROM ctx_turso_events", ())
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.get::<Option<String>>(0))
+        .transpose()?
+        .flatten())
 }
 
 async fn ensure_dedupe_key_column(conn: &libsql::Connection) -> Result<()> {
@@ -482,20 +570,22 @@ async fn search(args: TursoSearchArgs) -> Result<()> {
     let (sql, params) = match (layout, args.provider.as_deref()) {
         (RemoteLayout::Projection, Some(provider)) => (
             "SELECT event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json \
-             FROM ctx_turso_events WHERE provider = ?1 AND payload_json LIKE ?2 ESCAPE '\\' COLLATE NOCASE \
+             FROM ctx_turso_events JOIN ctx_turso_search USING(event_id) \
+             WHERE provider = ?1 AND ctx_turso_search MATCH ?2 \
              ORDER BY occurred_at_ms DESC LIMIT ?3",
             libsql::params_from_iter(vec![
                 libsql::Value::Text(provider.to_owned()),
-                libsql::Value::Text(substring_pattern(&args.query)),
+                libsql::Value::Text(fts_match_query(&args.query)),
                 libsql::Value::Integer(args.limit as i64),
             ]),
         ),
         (RemoteLayout::Projection, None) => (
             "SELECT event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json \
-             FROM ctx_turso_events WHERE payload_json LIKE ?1 ESCAPE '\\' COLLATE NOCASE \
+             FROM ctx_turso_events JOIN ctx_turso_search USING(event_id) \
+             WHERE ctx_turso_search MATCH ?1 \
              ORDER BY occurred_at_ms DESC LIMIT ?2",
             libsql::params_from_iter(vec![
-                libsql::Value::Text(substring_pattern(&args.query)),
+                libsql::Value::Text(fts_match_query(&args.query)),
                 libsql::Value::Integer(args.limit as i64),
             ]),
         ),
@@ -621,6 +711,15 @@ fn substring_pattern(query: &str) -> String {
     )
 }
 
+fn fts_match_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
 async fn remote_layout(conn: &libsql::Connection) -> Result<RemoteLayout> {
     if conn
         .query("SELECT 1 FROM ctx_turso_events LIMIT 1", ())
@@ -629,16 +728,19 @@ async fn remote_layout(conn: &libsql::Connection) -> Result<RemoteLayout> {
     {
         return Ok(RemoteLayout::Projection);
     }
-    if conn
-        .query("SELECT 1 FROM ctx_events LIMIT 1", ())
-        .await
-        .is_ok()
-    {
+    if has_imported_snapshot(conn).await? {
         return Ok(RemoteLayout::Snapshot);
     }
     Err(anyhow!(
         "remote database is neither a ctx Turso projection nor an imported ctx SQLite snapshot"
     ))
+}
+
+async fn has_imported_snapshot(conn: &libsql::Connection) -> Result<bool> {
+    Ok(conn
+        .query("SELECT 1 FROM ctx_events LIMIT 1", ())
+        .await
+        .is_ok())
 }
 
 async fn print_snapshot_status(conn: &libsql::Connection, json_output: bool) -> Result<()> {
