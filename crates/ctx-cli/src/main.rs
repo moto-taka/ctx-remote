@@ -181,35 +181,35 @@ struct DoctorArgs {
 }
 
 #[derive(Debug, Args)]
-struct ImportArgs {
+pub(crate) struct ImportArgs {
     #[arg(
         long,
         value_parser = parse_native_provider_arg,
         hide_possible_values = true,
         help = "Import one provider, for example codex, claude, cursor, pi, copilot-cli, or opencode"
     )]
-    provider: Option<NativeProviderArg>,
+    pub(crate) provider: Option<NativeProviderArg>,
     #[arg(
         long,
         help = "Import exactly this path; native provider paths require --provider"
     )]
-    path: Option<PathBuf>,
+    pub(crate) path: Option<PathBuf>,
     #[arg(long = "history-source", conflicts_with_all = ["provider", "path", "format", "all"])]
-    history_source: Option<String>,
+    pub(crate) history_source: Option<String>,
     #[arg(
         long = "history-source-manifest",
         conflicts_with_all = ["provider", "path", "format"]
     )]
-    history_source_manifest: Vec<PathBuf>,
+    pub(crate) history_source_manifest: Vec<PathBuf>,
     #[arg(long = "reset-cursor")]
-    reset_cursor: bool,
+    pub(crate) reset_cursor: bool,
     #[arg(
         long,
         value_enum,
         requires = "path",
         conflicts_with_all = ["provider", "all", "history_source"]
     )]
-    format: Option<ImportFormatArg>,
+    pub(crate) format: Option<ImportFormatArg>,
     #[arg(long, conflicts_with_all = ["provider", "path", "format", "history_source"])]
     all: bool,
     #[arg(long)]
@@ -217,7 +217,7 @@ struct ImportArgs {
     #[arg(long, help = "Do not start daemon maintenance after import")]
     no_daemon: bool,
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
     #[arg(long, value_enum, default_value_t = ProgressArg::Auto)]
     progress: ProgressArg,
 }
@@ -459,7 +459,7 @@ impl SearchBackendArg {
 #[derive(Debug, Args, Clone)]
 pub(crate) struct DaemonArgs {
     #[command(subcommand)]
-    command: DaemonCommand,
+    pub(crate) command: DaemonCommand,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -479,11 +479,11 @@ pub(crate) struct DaemonRunArgs {
     #[arg(long, conflicts_with = "once", hide = true)]
     foreground: bool,
     #[arg(long, help = "Run one maintenance pass and exit")]
-    once: bool,
+    pub(crate) once: bool,
     #[arg(long, value_parser = parse_daemon_idle_exit_seconds)]
     idle_exit_seconds: Option<u64>,
     #[arg(long, value_parser = parse_daemon_interval_seconds)]
-    loop_interval_seconds: Option<u64>,
+    pub(crate) loop_interval_seconds: Option<u64>,
     #[arg(long, value_parser = parse_semantic_worker_batch)]
     max_chunks: Option<usize>,
     #[arg(skip)]
@@ -495,7 +495,7 @@ pub(crate) struct DaemonRunArgs {
     #[arg(long, value_enum, hide = true)]
     trigger_command: Option<DaemonTriggerCommandArg>,
     #[arg(long, help = "Print machine-readable JSON")]
-    json: bool,
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -725,9 +725,9 @@ fn main() -> Result<()> {
         CommandRoot::Sources(args) => {
             run_sources(args, data_root.clone(), &mut analytics_properties)
         }
-        CommandRoot::Import(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
-            "ctx import is disabled in remote-primary mode; use ctx turso import until direct provider-to-Turso ingestion is available"
-        )),
+        CommandRoot::Import(args) if commands::turso::remote_primary_configured() => {
+            commands::turso::run_remote_primary_import(args)
+        }
         CommandRoot::Import(args) => run_import(args, data_root.clone(), &mut analytics_properties),
         CommandRoot::Show(args) if commands::turso::remote_primary_configured() => {
             commands::turso::run_remote_primary_show(args)
@@ -748,9 +748,9 @@ fn main() -> Result<()> {
         CommandRoot::Docs(args) => docs::run(args),
         CommandRoot::Integrations(args) => integrations::run(args, &mut analytics_properties),
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
-        CommandRoot::Daemon(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
-            "ctx daemon is disabled in remote-primary mode because semantic indexing uses local SQLite"
-        )),
+        CommandRoot::Daemon(args) if commands::turso::remote_primary_configured() => {
+            commands::turso::run_remote_primary_daemon(args)
+        }
         CommandRoot::Daemon(args) => semantic::run_daemon_command(args, data_root.clone(), &config),
         CommandRoot::Upgrade(args) => upgrade::run(
             args,

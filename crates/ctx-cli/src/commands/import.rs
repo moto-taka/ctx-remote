@@ -80,17 +80,19 @@ mod native;
 mod report;
 mod requests;
 
+pub(crate) use catalog::source_stats;
 #[cfg(test)]
 pub(crate) use catalog::{catalog_import_checkpoint_matches, sha256_file_prefix_hex};
 use catalog::{
     import_incremental_codex_session_tree, import_record_for_custom_history,
-    import_record_for_history_source_plugin, import_record_for_source, source_stats,
+    import_record_for_history_source_plugin, import_record_for_source,
     source_uses_incremental_event_search,
 };
 use explicit::run_explicit_format_import;
 pub(crate) use inventory::{
     inventory_available_sources, inventory_import_sources, ImportInventory,
 };
+pub(crate) use manifest::collect_source_import_paths;
 use native::{import_one_source, validate_source_import_supported};
 pub(crate) use native::{
     import_one_source_for_search_refresh, import_one_source_without_search_refresh,
@@ -105,8 +107,8 @@ pub(crate) use report::{
     error_summary, import_error_scope, import_totals_json, one_line_error, source_error_reason,
 };
 pub(crate) use report::{ImportFailureScope, ImportFailureType};
-pub(crate) use requests::import_history_source_plugin;
-use requests::{history_source_plugin_import_requests, import_requests, validate_import_args};
+use requests::{history_source_plugin_import_requests, validate_import_args};
+pub(crate) use requests::{import_history_source_plugin, import_requests};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ImportTotals {
@@ -977,13 +979,19 @@ pub(crate) fn run_import_internal(
 /// Store to `persist` before dropping it. This is the zero-persistent-storage import boundary
 /// used by remote-primary backends: a provider source never needs a `work.sqlite` file and one
 /// source cannot retain records from a previously processed source.
-pub(crate) fn import_all_providers_in_memory_by_source<F>(
+pub(crate) fn import_all_providers_in_memory_by_source<S, F, C, P>(
     provider: Option<NativeProviderArg>,
     path: Option<PathBuf>,
+    mut should_import: S,
     mut persist: F,
+    mut complete: C,
+    mut should_import_file: P,
 ) -> Result<ImportTotals>
 where
-    F: FnMut(Store) -> Result<()>,
+    S: FnMut(&SourceInfo) -> Result<bool>,
+    F: FnMut(&SourceInfo, Store) -> Result<()>,
+    C: FnMut(&SourceInfo) -> Result<()>,
+    P: FnMut(&SourceInfo, &Path) -> Result<bool>,
 {
     let all = provider.is_none() && path.is_none();
     let args = ImportArgs {
@@ -1000,8 +1008,14 @@ where
         progress: ProgressArg::None,
     };
     let requests = import_requests(&args)?;
+    let mut changed_sources = Vec::with_capacity(requests.len());
+    for source in requests {
+        if should_import(&source)? {
+            changed_sources.push(source);
+        }
+    }
     let inventory_store = Store::open_in_memory()?;
-    let inventory = inventory_import_sources(&inventory_store, requests, true)?;
+    let inventory = inventory_import_sources(&inventory_store, changed_sources, true)?;
     drop(inventory_store);
 
     let mut totals = ImportTotals::default();
@@ -1013,7 +1027,25 @@ where
             && plan.source.source_format == "codex_session_jsonl_tree"
             && plan.source.path.is_dir()
         {
-            let summary = import_codex_tree_in_memory_chunks(&plan.source, &mut persist)?;
+            let summary = import_codex_tree_in_memory_chunks(
+                &plan.source,
+                &mut persist,
+                &mut should_import_file,
+            )?;
+            complete(&plan.source)?;
+            totals.add(&summary, &plan.stats);
+            continue;
+        }
+        if plan.source.provider == CaptureProvider::Claude
+            && plan.source.source_format == "claude_projects_jsonl_tree"
+            && plan.source.path.is_dir()
+        {
+            let summary = import_claude_tree_in_memory_chunks(
+                &plan.source,
+                &mut persist,
+                &mut should_import_file,
+            )?;
+            complete(&plan.source)?;
             totals.add(&summary, &plan.stats);
             continue;
         }
@@ -1026,7 +1058,8 @@ where
             &plan.preinventory,
         ) {
             Ok(summary) => {
-                persist(store)?;
+                persist(&plan.source, store)?;
+                complete(&plan.source)?;
                 totals.add(&summary, &plan.stats);
             }
             Err(error) if import_error_scope(&error) == ImportFailureScope::Source => {
@@ -1038,16 +1071,44 @@ where
     Ok(totals)
 }
 
+pub(crate) fn remote_native_import_requests(
+    provider: Option<NativeProviderArg>,
+    path: Option<PathBuf>,
+) -> Result<Vec<SourceInfo>> {
+    let all = provider.is_none() && path.is_none();
+    let args = ImportArgs {
+        provider,
+        path,
+        history_source: None,
+        history_source_manifest: Vec::new(),
+        reset_cursor: false,
+        format: None,
+        all,
+        resume: true,
+        no_daemon: true,
+        json: false,
+        progress: ProgressArg::None,
+    };
+    import_requests(&args)
+}
+
 const REMOTE_IN_MEMORY_CODEX_SESSION_BATCH_SIZE: usize = 8;
 
-fn import_codex_tree_in_memory_chunks<F>(
+fn import_codex_tree_in_memory_chunks<F, P>(
     source: &SourceInfo,
     persist: &mut F,
+    should_import_file: &mut P,
 ) -> Result<ProviderImportSummary>
 where
-    F: FnMut(Store) -> Result<()>,
+    F: FnMut(&SourceInfo, Store) -> Result<()>,
+    P: FnMut(&SourceInfo, &Path) -> Result<bool>,
 {
-    let paths = codex_session_paths(&source.path)?;
+    let mut paths = Vec::new();
+    for path in codex_session_paths(&source.path)? {
+        if should_import_file(source, &path)? {
+            paths.push(path);
+        }
+    }
     let record = import_record_for_source(source);
     let mut merged = ProviderImportSummary::default();
     for paths in paths.chunks(REMOTE_IN_MEMORY_CODEX_SESSION_BATCH_SIZE) {
@@ -1063,7 +1124,44 @@ where
             },
         )
         .map_err(anyhow::Error::from)?;
-        persist(store)?;
+        persist(source, store)?;
+        merged.merge_from(summary);
+    }
+    Ok(merged)
+}
+
+/// Claude project histories are a tree of independent JSONL session files. Importing the whole
+/// tree at once materializes every parsed event in one in-memory Store, so keep each file in its
+/// own short-lived Store before it is sent to the remote-primary backend.
+fn import_claude_tree_in_memory_chunks<F, P>(
+    source: &SourceInfo,
+    persist: &mut F,
+    should_import_file: &mut P,
+) -> Result<ProviderImportSummary>
+where
+    F: FnMut(&SourceInfo, Store) -> Result<()>,
+    P: FnMut(&SourceInfo, &Path) -> Result<bool>,
+{
+    let paths = collect_source_import_paths(source)?;
+    let record = import_record_for_source(source);
+    let mut merged = ProviderImportSummary::default();
+    for path in paths {
+        if !should_import_file(source, &path)? {
+            continue;
+        }
+        let mut store = Store::open_in_memory()?;
+        store.upsert_record(&record)?;
+        let summary = import_claude_projects_jsonl_tree(
+            &path,
+            &mut store,
+            ClaudeProjectsImportOptions {
+                source_path: Some(source.path.clone()),
+                history_record_id: Some(record.id),
+                ..ClaudeProjectsImportOptions::default()
+            },
+        )
+        .map_err(anyhow::Error::from)?;
+        persist(source, store)?;
         merged.merge_from(summary);
     }
     Ok(merged)

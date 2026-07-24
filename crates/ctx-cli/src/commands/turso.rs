@@ -1,10 +1,18 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use ctx_history_core::{database_path, SyncState, Visibility};
 use ctx_history_store::Store;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -21,6 +29,10 @@ const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 200;
 const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_PROJECTION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const DEFAULT_REMOTE_SYNC_INTERVAL_SECONDS: u64 = 300;
+const MIN_REMOTE_SYNC_INTERVAL_SECONDS: u64 = 15;
+const MAX_REMOTE_SYNC_INTERVAL_SECONDS: u64 = 3_600;
+const REMOTE_SYNC_MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 #[derive(Debug, Args)]
 pub(crate) struct TursoArgs {
@@ -103,6 +115,24 @@ struct TursoImportArgs {
     provider: Option<crate::NativeProviderArg>,
     #[arg(long, requires = "provider", help = "Import one provider history path")]
     path: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "watch",
+        help = "Record current provider source fingerprints as an already-imported Turso snapshot baseline"
+    )]
+    adopt_snapshot: bool,
+    #[arg(
+        long,
+        help = "Keep importing changed provider histories into Turso at a fixed interval"
+    )]
+    watch: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REMOTE_SYNC_INTERVAL_SECONDS,
+        value_parser = parse_remote_sync_interval_seconds,
+        help = "Polling interval for --watch, in seconds (15-3600)"
+    )]
+    interval_seconds: u64,
     #[arg(long)]
     json: bool,
 }
@@ -167,6 +197,24 @@ struct TursoPushReport {
     batches: usize,
 }
 
+#[derive(Clone, Debug)]
+struct RemoteSourceCheckpoint {
+    key: String,
+    fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteCheckpointState {
+    fingerprint: String,
+    updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSourceCheckpoint {
+    checkpoint: RemoteSourceCheckpoint,
+    previous_updated_at_ms: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RemoteLayout {
     Projection,
@@ -180,6 +228,7 @@ pub(crate) fn run_turso(args: TursoArgs, data_root: PathBuf) -> Result<()> {
             let db_path = database_path(data_root);
             let store = open_existing_store_read_only(&db_path, "ctx turso push")?;
             let json_output = args.json;
+            run_async(ensure_remote_schema())?;
             let report = run_async(push(store, args))?;
             print_push_report(&report, json_output)
         }
@@ -192,6 +241,52 @@ pub(crate) fn run_turso(args: TursoArgs, data_root: PathBuf) -> Result<()> {
 
 pub(crate) fn remote_primary_configured() -> bool {
     env::var_os(DATABASE_URL_ENV).is_some()
+}
+
+pub(crate) fn run_remote_primary_import(args: crate::ImportArgs) -> Result<()> {
+    if args.format.is_some()
+        || args.history_source.is_some()
+        || !args.history_source_manifest.is_empty()
+        || args.reset_cursor
+    {
+        return Err(anyhow!(
+            "remote-primary ctx import supports native providers only; use --provider, --path, or --all"
+        ));
+    }
+    run_turso_import(TursoImportArgs {
+        batch_size: DEFAULT_PUSH_BATCH_SIZE,
+        provider: args.provider,
+        path: args.path,
+        adopt_snapshot: false,
+        watch: false,
+        interval_seconds: DEFAULT_REMOTE_SYNC_INTERVAL_SECONDS,
+        json: args.json,
+    })
+}
+
+pub(crate) fn run_remote_primary_daemon(args: crate::DaemonArgs) -> Result<()> {
+    match args.command {
+        crate::DaemonCommand::Run(args) => {
+            let interval_seconds = args
+                .loop_interval_seconds
+                .unwrap_or(DEFAULT_REMOTE_SYNC_INTERVAL_SECONDS);
+            parse_remote_sync_interval_seconds(&interval_seconds.to_string())
+                .map_err(|message| anyhow!(message))?;
+            run_turso_import(TursoImportArgs {
+                batch_size: DEFAULT_PUSH_BATCH_SIZE,
+                provider: None,
+                path: None,
+                adopt_snapshot: false,
+                watch: !args.once,
+                interval_seconds,
+                json: args.json,
+            })
+        }
+        crate::DaemonCommand::Status(args) => run_remote_primary_status(args.json),
+        crate::DaemonCommand::Enable(_) | crate::DaemonCommand::Disable(_) => Err(anyhow!(
+            "remote-primary does not persist a local daemon setting; run `ctx daemon run` to sync in the foreground"
+        )),
+    }
 }
 
 pub(crate) fn run_remote_primary_status(json_output: bool) -> Result<()> {
@@ -282,16 +377,98 @@ pub(crate) fn remote_primary_event_value(id: &str) -> Result<serde_json::Value> 
 }
 
 fn run_turso_import(args: TursoImportArgs) -> Result<()> {
+    if args.adopt_snapshot {
+        return run_turso_adopt_snapshot(&args);
+    }
+    if !args.watch {
+        return run_turso_import_once(&args).map(|_| ());
+    }
+
+    let interval = Duration::from_secs(args.interval_seconds);
+    let mut consecutive_failures = 0usize;
+    loop {
+        match run_turso_import_once(&args) {
+            Ok(_) => consecutive_failures = 0,
+            Err(error) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= REMOTE_SYNC_MAX_CONSECUTIVE_FAILURES {
+                    return Err(error.context(format!(
+                        "remote-primary sync stopped after {REMOTE_SYNC_MAX_CONSECUTIVE_FAILURES} consecutive failures"
+                    )));
+                }
+                eprintln!(
+                    "remote-primary sync failed ({consecutive_failures}/{REMOTE_SYNC_MAX_CONSECUTIVE_FAILURES}); retrying in {} seconds: {error:#}",
+                    interval.as_secs()
+                );
+            }
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn run_turso_adopt_snapshot(args: &TursoImportArgs) -> Result<()> {
+    run_async(ensure_remote_schema())?;
+    if !run_async(remote_has_snapshot())? {
+        return Err(anyhow!(
+            "ctx turso import --adopt-snapshot requires a previously imported ctx SQLite snapshot"
+        ));
+    }
+    let sources =
+        crate::commands::import::remote_native_import_requests(args.provider, args.path.clone())?;
+    let mut adopted = 0usize;
+    for source in sources {
+        let checkpoint = remote_source_checkpoint(&source)?;
+        run_async(remote_store_checkpoint(&checkpoint))?;
+        adopted = adopted.saturating_add(1);
+    }
+    if args.json {
+        print_json(json!({
+            "adopted_snapshot": true,
+            "providers_adopted": adopted,
+            "remote_primary": true,
+        }))?;
+    } else {
+        println!("adopted_snapshot: true");
+        println!("providers_adopted: {adopted}");
+    }
+    Ok(())
+}
+
+fn run_turso_import_once(args: &TursoImportArgs) -> Result<TursoPushReport> {
+    run_async(ensure_remote_schema())?;
     let mut report = TursoPushReport {
         uploaded_events: 0,
         skipped_events: 0,
         scanned_events: 0,
         batches: 0,
     };
+    let checkpoints = RefCell::new(HashMap::<String, PendingSourceCheckpoint>::new());
+    let unchanged_sources = Cell::new(0usize);
     let totals = crate::commands::import::import_all_providers_in_memory_by_source(
         args.provider,
-        args.path,
-        |store| {
+        args.path.clone(),
+        |source| {
+            let checkpoint = remote_source_checkpoint(source)?;
+            let previous = run_async(remote_checkpoint_state(&checkpoint))?;
+            if previous
+                .as_ref()
+                .is_some_and(|state| state.fingerprint == checkpoint.fingerprint)
+            {
+                unchanged_sources.set(unchanged_sources.get().saturating_add(1));
+            } else {
+                checkpoints.borrow_mut().insert(
+                    checkpoint.key.clone(),
+                    PendingSourceCheckpoint {
+                        checkpoint,
+                        previous_updated_at_ms: previous.map(|state| state.updated_at_ms),
+                    },
+                );
+            }
+            Ok(checkpoints
+                .borrow()
+                .contains_key(&source_checkpoint_key(source)))
+        },
+        |_source, store| {
             let source_report = run_async(push(
                 store,
                 TursoPushArgs {
@@ -314,11 +491,42 @@ fn run_turso_import(args: TursoImportArgs) -> Result<()> {
             report.batches = report.batches.saturating_add(source_report.batches);
             Ok(())
         },
+        |source| {
+            let current = remote_source_checkpoint(source)?;
+            let Some(before) = checkpoints.borrow_mut().remove(&current.key) else {
+                return Ok(());
+            };
+            if before.checkpoint.fingerprint == current.fingerprint {
+                run_async(remote_store_checkpoint(&current))?;
+            }
+            Ok(())
+        },
+        |source, path| {
+            let key = source_checkpoint_key(source);
+            let checkpoints = checkpoints.borrow();
+            let Some(pending) = checkpoints.get(&key) else {
+                return Ok(false);
+            };
+            let Some(updated_at_ms) = pending.previous_updated_at_ms else {
+                return Ok(true);
+            };
+            let modified_at_ms = fs::metadata(path)
+                .with_context(|| format!("stat provider history file {}", path.display()))?
+                .modified()
+                .unwrap_or(UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX);
+            Ok(modified_at_ms > updated_at_ms)
+        },
     )?;
     if args.json {
         print_json(json!({
             "ephemeral_store": true,
             "providers_imported": totals.imported_sources,
+            "providers_skipped_unchanged": unchanged_sources.get(),
             "events_materialized": totals.imported_events,
             "source_failures": totals.failed_sources,
             "uploaded_events": report.uploaded_events,
@@ -327,14 +535,16 @@ fn run_turso_import(args: TursoImportArgs) -> Result<()> {
             "batches": report.batches,
             "idempotent": true,
             "remote_projection": true,
-        }))
+        }))?
     } else {
         println!("ephemeral_store: true");
         println!("providers_imported: {}", totals.imported_sources);
+        println!("providers_skipped_unchanged: {}", unchanged_sources.get());
         println!("events_materialized: {}", totals.imported_events);
         println!("source_failures: {}", totals.failed_sources);
-        print_push_report(&report, false)
+        print_push_report(&report, false)?
     }
+    Ok(report)
 }
 
 fn run_async<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -353,14 +563,39 @@ async fn connect() -> Result<libsql::Connection> {
 }
 
 async fn init(json_output: bool) -> Result<()> {
-    let conn = connect().await?;
-    ensure_schema(&conn).await?;
+    ensure_remote_schema().await?;
     if json_output {
         print_json(json!({"initialized": true, "remote_projection": true}))?;
     } else {
         println!("Turso ctx projection is ready.");
     }
     Ok(())
+}
+
+async fn remote_has_snapshot() -> Result<bool> {
+    let conn = connect().await?;
+    has_imported_snapshot(&conn).await
+}
+
+async fn ensure_remote_schema() -> Result<()> {
+    tokio::time::timeout(REMOTE_WRITE_TIMEOUT, async {
+        let conn = connect().await?;
+        if conn
+            .query("SELECT 1 FROM ctx_turso_event_keys LIMIT 1", ())
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        ensure_schema(&conn).await
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "prepare Turso remote-primary schema timed out after {} seconds",
+            REMOTE_WRITE_TIMEOUT.as_secs()
+        )
+    })?
 }
 
 async fn ensure_schema(conn: &libsql::Connection) -> Result<()> {
@@ -417,6 +652,105 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<()> {
     )
     .await
     .context("create Turso cross-device event key table")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ctx_turso_source_checkpoints (\
+            source_key TEXT PRIMARY KEY,\
+            fingerprint TEXT NOT NULL,\
+            updated_at_ms INTEGER NOT NULL\
+        )",
+        (),
+    )
+    .await
+    .context("create Turso remote source checkpoint table")?;
+    Ok(())
+}
+
+fn remote_source_checkpoint(
+    source: &crate::provider_sources::SourceInfo,
+) -> Result<RemoteSourceCheckpoint> {
+    let key = source_checkpoint_key(source);
+    let stats = crate::commands::import::source_stats(Path::new(&source.path))?;
+    let change_token = stats.change_token.ok_or_else(|| {
+        anyhow!(
+            "could not calculate a change token for {} provider history at {}",
+            source.provider.as_str(),
+            source.path.display()
+        )
+    })?;
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(source.provider.as_str().as_bytes());
+    fingerprint.update([0]);
+    fingerprint.update(source.source_format.as_bytes());
+    fingerprint.update([0]);
+    fingerprint.update((stats.files as u64).to_le_bytes());
+    fingerprint.update(stats.bytes.to_le_bytes());
+    fingerprint.update(change_token);
+    Ok(RemoteSourceCheckpoint {
+        key,
+        fingerprint: format!("sha256:{:x}", fingerprint.finalize()),
+    })
+}
+
+fn source_checkpoint_key(source: &crate::provider_sources::SourceInfo) -> String {
+    let source_path = fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
+    let mut identity = Sha256::new();
+    identity.update(source.provider.as_str().as_bytes());
+    identity.update([0]);
+    identity.update(source.source_format.as_bytes());
+    identity.update([0]);
+    identity.update(source_path.as_os_str().as_encoded_bytes());
+    format!("sha256:{:x}", identity.finalize())
+}
+
+async fn remote_checkpoint_state(
+    checkpoint: &RemoteSourceCheckpoint,
+) -> Result<Option<RemoteCheckpointState>> {
+    let conn = connect().await?;
+    let mut rows = conn
+        .query(
+            "SELECT fingerprint, updated_at_ms FROM ctx_turso_source_checkpoints WHERE source_key = ?1",
+            libsql::params![checkpoint.key.clone()],
+        )
+        .await
+        .context("read Turso remote source checkpoint")?;
+    let Some(row) = rows
+        .next()
+        .await
+        .context("read Turso remote source checkpoint row")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RemoteCheckpointState {
+        fingerprint: row.get::<String>(0)?,
+        updated_at_ms: row.get::<i64>(1)?,
+    }))
+}
+
+async fn remote_store_checkpoint(checkpoint: &RemoteSourceCheckpoint) -> Result<()> {
+    let conn = connect().await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
+    tokio::time::timeout(
+        REMOTE_WRITE_TIMEOUT,
+        conn.execute(
+            "INSERT INTO ctx_turso_source_checkpoints(source_key, fingerprint, updated_at_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(source_key) DO UPDATE SET fingerprint = excluded.fingerprint, updated_at_ms = excluded.updated_at_ms",
+            libsql::params![checkpoint.key.clone(), checkpoint.fingerprint.clone(), now],
+        ),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "store Turso remote source checkpoint timed out after {} seconds",
+            REMOTE_WRITE_TIMEOUT.as_secs()
+        )
+    })?
+    .context("store Turso remote source checkpoint")?;
     Ok(())
 }
 
@@ -508,7 +842,6 @@ async fn ensure_dedupe_key_column(conn: &libsql::Connection) -> Result<()> {
 
 async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
     let conn = connect().await?;
-    ensure_schema(&conn).await?;
     let session_identities = store
         .list_sessions()?
         .into_iter()
@@ -552,7 +885,17 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
             .iter()
             .filter_map(|event| remote_dedupe_candidate(event, &session_identities))
             .collect::<Vec<_>>();
-        let known_dedupe_keys = remote_existing_dedupe_keys(&conn, &dedupe_candidates).await?;
+        let known_dedupe_keys = tokio::time::timeout(
+            REMOTE_WRITE_TIMEOUT,
+            remote_existing_dedupe_keys(&conn, &dedupe_candidates),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "read Turso cross-device event keys timed out after {} seconds",
+                REMOTE_WRITE_TIMEOUT.as_secs()
+            )
+        })??;
 
         let mut sql = String::new();
         let mut exported_statements = 0usize;
@@ -694,86 +1037,16 @@ async fn remote_existing_dedupe_keys(
     while let Some(row) = rows.next().await.context("read Turso event key")? {
         existing.insert(row.get::<String>(0)?);
     }
-    if existing.len() == unique.len() || !has_imported_snapshot(conn).await? {
-        return Ok(existing);
-    }
-
-    let missing = candidates
-        .iter()
-        .filter(|candidate| !existing.contains(&candidate.canonical))
-        .collect::<Vec<_>>();
-    let predicates = missing
-        .iter()
-        .map(|candidate| {
-            format!(
-                "(s.provider = {} AND s.external_session_id = {} AND e.dedupe_key LIKE {} ESCAPE '\\')",
-                sql_text_literal(&candidate.provider),
-                sql_text_literal(&candidate.external_session_id),
-                sql_text_literal(&provider_source_dedupe_pattern(&candidate.source_dedupe_key))
-            )
-        })
-        .collect::<Vec<_>>();
-    if predicates.is_empty() {
-        return Ok(existing);
-    }
-    let raw_sql = format!(
-        "SELECT s.provider, s.external_session_id, e.dedupe_key, e.id \
-         FROM events e JOIN sessions s ON s.id = e.session_id WHERE {}",
-        predicates.join(" OR ")
-    );
-    let mut raw_rows = conn
-        .query(&raw_sql, ())
-        .await
-        .context("match imported snapshot events for remote dedupe")?;
-    let requested = missing
-        .iter()
-        .map(|candidate| candidate.canonical.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut matches = Vec::new();
-    while let Some(row) = raw_rows
-        .next()
-        .await
-        .context("read imported snapshot dedupe match")?
-    {
-        let provider = row.get::<String>(0)?;
-        let external_session_id = row.get::<String>(1)?;
-        let source_dedupe_key = row.get::<String>(2)?;
-        let Some(canonical) = canonical_provider_source_dedupe_key(
-            &provider,
-            Some(&external_session_id),
-            &source_dedupe_key,
-        ) else {
-            continue;
-        };
-        if requested.contains(canonical.as_str()) {
-            matches.push((canonical, row.get::<String>(3)?));
-        }
-    }
-    if !matches.is_empty() {
-        let mut write_sql = String::new();
-        for (canonical, event_id) in &matches {
-            write_sql.push_str(
-                "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) VALUES (",
-            );
-            write_sql.push_str(&sql_text_literal(canonical));
-            write_sql.push(',');
-            write_sql.push_str(&sql_text_literal(event_id));
-            write_sql.push_str(");");
-            existing.insert(canonical.clone());
-        }
-        conn.execute_transactional_batch(&write_sql)
-            .await
-            .context("cache imported snapshot remote dedupe matches")?;
-    }
+    // `ctx_turso_event_keys` is the authoritative cross-device merge point. Searching arbitrary
+    // suffixes in a multi-GB imported snapshot is an unindexed full-table scan and can stall a
+    // normal provider import indefinitely. New keys and projection events are committed together,
+    // so concurrent Macs still converge through this unique key table.
     Ok(existing)
 }
 
 #[derive(Clone)]
 struct RemoteDedupeCandidate {
     canonical: String,
-    provider: String,
-    external_session_id: String,
-    source_dedupe_key: String,
 }
 
 fn remote_dedupe_candidate(
@@ -792,26 +1065,7 @@ fn remote_dedupe_candidate(
         Some(external_session_id),
         &source_dedupe_key,
     )?;
-    Some(RemoteDedupeCandidate {
-        canonical,
-        provider: provider.clone(),
-        external_session_id: external_session_id.to_owned(),
-        source_dedupe_key,
-    })
-}
-
-fn provider_source_dedupe_pattern(source_dedupe_key: &str) -> String {
-    let suffix = source_dedupe_key
-        .strip_prefix("provider-source:")
-        .and_then(|value| value.split_once(':').map(|(_, suffix)| suffix))
-        .unwrap_or(source_dedupe_key);
-    format!(
-        "provider-source:%:{}",
-        suffix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    )
+    Some(RemoteDedupeCandidate { canonical })
 }
 
 fn sql_text_literal(value: &str) -> String {
@@ -989,9 +1243,7 @@ fn reject_remote_search_filters(args: &SearchArgs) -> Result<()> {
 async fn remote_snapshot_search(request: RemoteSearchRequest) -> Result<serde_json::Value> {
     let conn = connect().await?;
     if !has_imported_snapshot(&conn).await? {
-        return Err(anyhow!(
-            "remote-primary search requires an imported ctx SQLite snapshot"
-        ));
+        return remote_projection_search(&conn, request).await;
     }
     let mut filters = vec!["e.deleted_at_ms IS NULL".to_owned()];
     if let Some(provider) = request.provider.as_deref() {
@@ -1079,8 +1331,63 @@ async fn remote_snapshot_search(request: RemoteSearchRequest) -> Result<serde_js
     }))
 }
 
+async fn remote_projection_search(
+    conn: &libsql::Connection,
+    request: RemoteSearchRequest,
+) -> Result<serde_json::Value> {
+    if !has_projection(conn).await? {
+        return Err(anyhow!("remote-primary has no imported history yet"));
+    }
+    let mut filters = Vec::new();
+    if let Some(provider) = request.provider.as_deref() {
+        filters.push(format!("p.provider = {}", sql_text_literal(provider)));
+    }
+    if let Some(session) = request.session.as_deref() {
+        filters.push(format!(
+            "p.session_id LIKE {}",
+            sql_text_literal(&format!("{session}%"))
+        ));
+    }
+    if let Some(event_type) = request.event_type.as_deref() {
+        filters.push(format!("p.event_type = {}", sql_text_literal(event_type)));
+    }
+    let terms = std::iter::once(request.query.as_str())
+        .chain(request.terms.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(fts_match_query)
+        .collect::<Vec<_>>();
+    let where_clause = (!filters.is_empty())
+        .then(|| format!("WHERE {}", filters.join(" AND ")))
+        .unwrap_or_default();
+    let sql = if terms.is_empty() {
+        format!(
+            "SELECT p.event_id, p.session_id, p.provider, p.role, p.event_type, p.occurred_at_ms, p.payload_json \
+             FROM ctx_turso_events p {where_clause} ORDER BY p.occurred_at_ms DESC LIMIT {}",
+            request.limit
+        )
+    } else {
+        let conjunction = if filters.is_empty() { "WHERE" } else { "AND" };
+        format!(
+            "SELECT p.event_id, p.session_id, p.provider, p.role, p.event_type, p.occurred_at_ms, p.payload_json \
+             FROM ctx_turso_search JOIN ctx_turso_events p USING(event_id) {where_clause} \
+             {conjunction} ctx_turso_search MATCH {} ORDER BY p.occurred_at_ms DESC LIMIT {}",
+            sql_text_literal(&terms.join(" OR ")),
+            request.limit
+        )
+    };
+    Ok(json!({
+        "remote_primary": true,
+        "query": request.query,
+        "results": remote_event_rows(conn, &sql).await?,
+    }))
+}
+
 async fn remote_snapshot_session(id: &str) -> Result<serde_json::Value> {
     let conn = connect().await?;
+    if !has_imported_snapshot(&conn).await? {
+        return remote_projection_session(&conn, id).await;
+    }
     let session_match = remote_id_match("id", id);
     let session_sql = format!(
         "SELECT id, provider, external_session_id, started_at_ms, ended_at_ms FROM sessions \
@@ -1119,6 +1426,9 @@ async fn remote_snapshot_session(id: &str) -> Result<serde_json::Value> {
 
 async fn remote_snapshot_event(id: &str) -> Result<serde_json::Value> {
     let conn = connect().await?;
+    if !has_imported_snapshot(&conn).await? {
+        return remote_projection_event(&conn, id).await;
+    }
     let events = remote_event_rows(
         &conn,
         &format!(
@@ -1287,9 +1597,30 @@ async fn remote_status_value() -> Result<serde_json::Value> {
             "schema_version": schema_version,
         }));
     }
-    Err(anyhow!(
-        "remote-primary requires an imported ctx SQLite snapshot"
-    ))
+    remote_projection_status_value(&conn).await
+}
+
+async fn remote_projection_status_value(conn: &libsql::Connection) -> Result<serde_json::Value> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*), COUNT(DISTINCT provider), MIN(occurred_at_ms), MAX(occurred_at_ms) FROM ctx_turso_events",
+            (),
+        )
+        .await
+        .context("read Turso projection status")?;
+    let row = rows
+        .next()
+        .await
+        .context("read Turso projection status row")?
+        .ok_or_else(|| anyhow!("Turso projection status query returned no row"))?;
+    Ok(json!({
+        "remote_primary": true,
+        "storage_layout": "ctx_turso_projection",
+        "events": row.get::<i64>(0)?,
+        "providers": row.get::<i64>(1)?,
+        "oldest_event_ms": row.get::<Option<i64>>(2)?,
+        "newest_event_ms": row.get::<Option<i64>>(3)?,
+    }))
 }
 
 async fn status(json_output: bool) -> Result<()> {
@@ -1344,6 +1675,18 @@ fn parse_push_batch_size(value: &str) -> std::result::Result<usize, String> {
         ));
     }
     Ok(size)
+}
+
+fn parse_remote_sync_interval_seconds(value: &str) -> std::result::Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid remote sync interval: {error}"))?;
+    if !(MIN_REMOTE_SYNC_INTERVAL_SECONDS..=MAX_REMOTE_SYNC_INTERVAL_SECONDS).contains(&seconds) {
+        return Err(format!(
+            "remote sync interval must be between {MIN_REMOTE_SYNC_INTERVAL_SECONDS} and {MAX_REMOTE_SYNC_INTERVAL_SECONDS} seconds"
+        ));
+    }
+    Ok(seconds)
 }
 
 fn parse_search_limit(value: &str) -> std::result::Result<usize, String> {
@@ -1453,6 +1796,14 @@ mod tests {
         assert_eq!(parse_push_batch_size("250"), Ok(250));
         assert!(parse_push_batch_size("0").is_err());
         assert!(parse_push_batch_size("1001").is_err());
+    }
+
+    #[test]
+    fn validates_bounded_remote_sync_interval() {
+        assert_eq!(parse_remote_sync_interval_seconds("15"), Ok(15));
+        assert_eq!(parse_remote_sync_interval_seconds("300"), Ok(300));
+        assert!(parse_remote_sync_interval_seconds("14").is_err());
+        assert!(parse_remote_sync_interval_seconds("3601").is_err());
     }
 
     #[test]
