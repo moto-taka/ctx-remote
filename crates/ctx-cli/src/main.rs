@@ -4,7 +4,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod analytics;
@@ -704,6 +704,9 @@ fn main() -> Result<()> {
     }
 
     let result = match cli.command {
+        CommandRoot::Setup(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
+            "ctx setup is disabled in remote-primary mode because it creates a local SQLite index"
+        )),
         CommandRoot::Setup(args) => run_setup(
             args,
             data_root.clone(),
@@ -715,21 +718,39 @@ fn main() -> Result<()> {
             commands::turso::run_remote_primary_status(args.json)
         }
         CommandRoot::Status(args) => run_status(args, data_root.clone(), quiet),
+        CommandRoot::Index(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
+            "ctx index is disabled in remote-primary mode because it creates a local SQLite index"
+        )),
         CommandRoot::Index(args) => run_index(args, data_root.clone(), quiet),
         CommandRoot::Sources(args) => {
             run_sources(args, data_root.clone(), &mut analytics_properties)
         }
+        CommandRoot::Import(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
+            "ctx import is disabled in remote-primary mode; use ctx turso import until direct provider-to-Turso ingestion is available"
+        )),
         CommandRoot::Import(args) => run_import(args, data_root.clone(), &mut analytics_properties),
+        CommandRoot::Show(args) if commands::turso::remote_primary_configured() => {
+            commands::turso::run_remote_primary_show(args)
+        }
         CommandRoot::Show(args) => run_show(args, data_root.clone(), &mut analytics_properties),
         CommandRoot::Locate(args) => run_locate(args, data_root.clone(), &mut analytics_properties),
+        CommandRoot::Search(args) if commands::turso::remote_primary_configured() => {
+            commands::turso::run_remote_primary_search(args)
+        }
         CommandRoot::Search(args) => {
             run_search(args, data_root.clone(), &mut analytics_properties, &config)
         }
+        CommandRoot::Sql(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
+            "ctx sql is disabled in remote-primary mode; arbitrary remote SQL is not exposed"
+        )),
         CommandRoot::Sql(args) => run_sql(args, data_root.clone()),
         CommandRoot::Turso(args) => run_turso(args, data_root.clone()),
         CommandRoot::Docs(args) => docs::run(args),
         CommandRoot::Integrations(args) => integrations::run(args, &mut analytics_properties),
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
+        CommandRoot::Daemon(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
+            "ctx daemon is disabled in remote-primary mode because semantic indexing uses local SQLite"
+        )),
         CommandRoot::Daemon(args) => semantic::run_daemon_command(args, data_root.clone(), &config),
         CommandRoot::Upgrade(args) => upgrade::run(
             args,
@@ -737,6 +758,9 @@ fn main() -> Result<()> {
             config.clone(),
             &mut analytics_properties,
         ),
+        CommandRoot::Doctor(_) if commands::turso::remote_primary_configured() => Err(anyhow!(
+            "ctx doctor is disabled in remote-primary mode because it inspects a local SQLite index"
+        )),
         CommandRoot::Doctor(args) => run_doctor(args, data_root.clone(), &mut analytics_properties),
     };
     if is_setup {

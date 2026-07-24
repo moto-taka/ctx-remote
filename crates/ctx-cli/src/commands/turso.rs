@@ -7,7 +7,11 @@ use ctx_history_store::Store;
 use serde_json::json;
 use tokio::runtime::Runtime;
 
-use crate::{output::print_json, store_util::open_existing_store_read_only};
+use crate::{
+    output::{effective_format, print_json, OutputFormat},
+    store_util::open_existing_store_read_only,
+    SearchArgs, ShowArgs, ShowTarget,
+};
 
 const DATABASE_URL_ENV: &str = "CTX_TURSO_DATABASE_URL";
 const AUTH_TOKEN_ENV: &str = "CTX_TURSO_AUTH_TOKEN";
@@ -67,7 +71,7 @@ struct TursoPushArgs {
         long,
         default_value_t = DEFAULT_PUSH_BATCH_SIZE,
         value_parser = parse_push_batch_size,
-        help = "Number of events per remote transaction (1-250)"
+        help = "Number of events per remote transaction (1-1000)"
     )]
     batch_size: usize,
     #[arg(long, help = "Upload no more than this many events")]
@@ -92,7 +96,7 @@ struct TursoImportArgs {
         long,
         default_value_t = DEFAULT_PUSH_BATCH_SIZE,
         value_parser = parse_push_batch_size,
-        help = "Number of events per remote transaction (1-250)"
+        help = "Number of events per remote transaction (1-1000)"
     )]
     batch_size: usize,
     #[arg(long)]
@@ -188,6 +192,89 @@ pub(crate) fn remote_primary_configured() -> bool {
 
 pub(crate) fn run_remote_primary_status(json_output: bool) -> Result<()> {
     run_async(status(json_output))
+}
+
+/// Search the imported ctx snapshot directly.  This intentionally bypasses `Store`: opening a
+/// Store creates a local SQLite database and violates remote-primary mode.
+pub(crate) fn run_remote_primary_search(args: SearchArgs) -> Result<()> {
+    let query = args.query.as_deref().unwrap_or_default().trim().to_owned();
+    if query.is_empty() && args.term.iter().all(|term| term.trim().is_empty()) {
+        return Err(anyhow!("remote search needs a query or --term"));
+    }
+    reject_remote_search_filters(&args)?;
+    let provider = args
+        .provider
+        .map(|provider| provider.capture_provider().as_str().to_owned());
+    let value = run_async(remote_snapshot_search(RemoteSearchRequest {
+        query,
+        terms: args.term,
+        limit: args.limit,
+        provider,
+        session: args.session,
+        event_type: args.event_type,
+    }))?;
+    if args.json {
+        return print_json(value);
+    }
+    print_remote_search_text(&value);
+    Ok(())
+}
+
+pub(crate) fn run_remote_primary_show(args: ShowArgs) -> Result<()> {
+    match args.target {
+        ShowTarget::Session(args) => {
+            if args.provider.is_some() || args.provider_session.is_some() {
+                return Err(anyhow!(
+                    "remote ctx show session currently accepts a ctx session id only"
+                ));
+            }
+            let id = args
+                .id
+                .ok_or_else(|| anyhow!("ctx session id is required"))?;
+            let value = run_async(remote_snapshot_session(&id))?;
+            write_remote_show(&value, effective_format(args.format, args.json), args.out)?;
+            Ok(())
+        }
+        ShowTarget::Event(args) => {
+            if args.before != 0 || args.after != 0 || args.window.is_some() {
+                return Err(anyhow!(
+                    "remote ctx show event currently returns one event; surrounding windows are not available"
+                ));
+            }
+            let value = run_async(remote_snapshot_event(&args.id))?;
+            write_remote_show(&value, effective_format(args.format, args.json), None)?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn remote_primary_status_value() -> Result<serde_json::Value> {
+    run_async(remote_status_value())
+}
+
+pub(crate) fn remote_primary_search_value(
+    query: String,
+    limit: usize,
+    provider: Option<String>,
+    session: Option<String>,
+    event_type: Option<String>,
+) -> Result<serde_json::Value> {
+    run_async(remote_snapshot_search(RemoteSearchRequest {
+        query,
+        terms: Vec::new(),
+        limit,
+        provider,
+        session,
+        event_type,
+    }))
+}
+
+pub(crate) fn remote_primary_session_value(id: &str) -> Result<serde_json::Value> {
+    run_async(remote_snapshot_session(id))
+}
+
+pub(crate) fn remote_primary_event_value(id: &str) -> Result<serde_json::Value> {
+    run_async(remote_snapshot_event(id))
 }
 
 fn run_turso_import(args: TursoImportArgs) -> Result<()> {
@@ -466,7 +553,19 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
             push_optional_sql_text_literal(&mut sql, dedupe_key);
             sql.push(',');
             sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
-            sql.push_str(", '');");
+            sql.push(',');
+            sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
+            sql.push_str(");");
+            // FTS5 has no unique event-id constraint. Replace this document in the same remote
+            // transaction so retries remain idempotent and newly imported events are searchable.
+            sql.push_str("DELETE FROM ctx_turso_search WHERE event_id = ");
+            sql.push_str(sql_text_literal(event.id.to_string().as_str()).as_str());
+            sql.push_str(";");
+            sql.push_str("INSERT INTO ctx_turso_search(event_id, search_text) VALUES (");
+            sql.push_str(sql_text_literal(event.id.to_string().as_str()).as_str());
+            sql.push(',');
+            sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
+            sql.push_str(");");
             exported_statements += 1;
         }
         if exported_statements > 0 {
@@ -635,6 +734,282 @@ async fn search(args: TursoSearchArgs) -> Result<()> {
     Ok(())
 }
 
+struct RemoteSearchRequest {
+    query: String,
+    terms: Vec<String>,
+    limit: usize,
+    provider: Option<String>,
+    session: Option<String>,
+    event_type: Option<String>,
+}
+
+fn reject_remote_search_filters(args: &SearchArgs) -> Result<()> {
+    let unsupported = [
+        (args.history_source.is_some(), "--history-source"),
+        (args.provider_key.is_some(), "--provider-key"),
+        (args.source_id.is_some(), "--source-id"),
+        (args.source_format.is_some(), "--source-format"),
+        (args.workspace.is_some(), "--workspace"),
+        (args.since.is_some(), "--since"),
+        (args.primary_only, "--primary-only"),
+        (args.include_subagents, "--include-subagents"),
+        (args.file.is_some(), "--file"),
+        (args.include_current_session, "--include-current-session"),
+    ];
+    if let Some((_, flag)) = unsupported.into_iter().find(|(enabled, _)| *enabled) {
+        return Err(anyhow!(
+            "{flag} is not available in remote-primary mode yet; use query, --term, --provider, --session, or --event-type"
+        ));
+    }
+    if !matches!(args.backend, None | Some(crate::SearchBackendArg::Lexical)) {
+        return Err(anyhow!(
+            "semantic search is local-only; use --backend lexical in remote-primary mode"
+        ));
+    }
+    Ok(())
+}
+
+async fn remote_snapshot_search(request: RemoteSearchRequest) -> Result<serde_json::Value> {
+    let conn = connect().await?;
+    if !has_imported_snapshot(&conn).await? {
+        return Err(anyhow!(
+            "remote-primary search requires an imported ctx SQLite snapshot"
+        ));
+    }
+    let mut filters = vec!["e.deleted_at_ms IS NULL".to_owned()];
+    if let Some(provider) = request.provider.as_deref() {
+        filters.push(format!("s.provider = {}", sql_text_literal(provider)));
+    }
+    if let Some(session) = request.session.as_deref() {
+        filters.push(format!(
+            "e.session_id LIKE {}",
+            sql_text_literal(&format!("{session}%"))
+        ));
+    }
+    if let Some(event_type) = request.event_type.as_deref() {
+        filters.push(format!("e.event_type = {}", sql_text_literal(event_type)));
+    }
+    let terms = std::iter::once(request.query.as_str())
+        .chain(request.terms.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(fts_match_query)
+        .collect::<Vec<_>>();
+    let where_clause = filters.join(" AND ");
+    let sql = if terms.is_empty() {
+        format!(
+            "SELECT e.id, e.session_id, COALESCE(s.provider, 'unknown'), e.role, e.event_type, e.occurred_at_ms, e.payload_json \
+             FROM events e LEFT JOIN sessions s ON s.id = e.session_id \
+             WHERE {where_clause} ORDER BY e.occurred_at_ms DESC LIMIT {}",
+            request.limit
+        )
+    } else {
+        format!(
+            "SELECT e.id, e.session_id, COALESCE(s.provider, 'unknown'), e.role, e.event_type, e.occurred_at_ms, e.payload_json \
+             FROM event_search es JOIN events e ON e.id = es.event_id \
+             LEFT JOIN sessions s ON s.id = e.session_id \
+             WHERE event_search MATCH {} AND {where_clause} \
+             ORDER BY e.occurred_at_ms DESC LIMIT {}",
+            sql_text_literal(&terms.join(" OR ")),
+            request.limit
+        )
+    };
+    let mut results = remote_event_rows(&conn, &sql).await?;
+    // `ctx turso import` writes portable events into the projection table. Keep those events
+    // searchable while an imported snapshot remains the authoritative historical corpus.
+    if !terms.is_empty() && has_projection(&conn).await? {
+        let mut projection_filters = vec!["raw_event.id IS NULL".to_owned()];
+        if let Some(provider) = request.provider.as_deref() {
+            projection_filters.push(format!("p.provider = {}", sql_text_literal(provider)));
+        }
+        if let Some(session) = request.session.as_deref() {
+            projection_filters.push(format!(
+                "p.session_id LIKE {}",
+                sql_text_literal(&format!("{session}%"))
+            ));
+        }
+        if let Some(event_type) = request.event_type.as_deref() {
+            projection_filters.push(format!("p.event_type = {}", sql_text_literal(event_type)));
+        }
+        let projection_sql = format!(
+            "SELECT p.event_id, p.session_id, p.provider, p.role, p.event_type, p.occurred_at_ms, p.payload_json \
+             FROM ctx_turso_search JOIN ctx_turso_events p USING(event_id) \
+             LEFT JOIN events raw_event ON raw_event.id = p.event_id \
+             WHERE ctx_turso_search MATCH {} AND {} ORDER BY p.occurred_at_ms DESC LIMIT {}",
+            sql_text_literal(&terms.join(" OR ")),
+            projection_filters.join(" AND "),
+            request.limit
+        );
+        results.extend(remote_event_rows(&conn, &projection_sql).await?);
+        results.sort_by_key(|event| {
+            std::cmp::Reverse(
+                event
+                    .get("occurred_at_ms")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default(),
+            )
+        });
+        results.truncate(request.limit);
+    }
+    Ok(json!({
+        "remote_primary": true,
+        "query": request.query,
+        "results": results,
+    }))
+}
+
+async fn remote_snapshot_session(id: &str) -> Result<serde_json::Value> {
+    let conn = connect().await?;
+    let session_match = remote_id_match("id", id);
+    let session_sql = format!(
+        "SELECT id, provider, external_session_id, started_at_ms, ended_at_ms FROM sessions \
+         WHERE {session_match} AND deleted_at_ms IS NULL LIMIT 2",
+    );
+    let mut sessions = conn.query(&session_sql, ()).await?;
+    let Some(session) = sessions.next().await? else {
+        return Err(anyhow!("remote ctx session {id} was not found"));
+    };
+    if sessions.next().await?.is_some() {
+        return Err(anyhow!("remote ctx session id prefix {id} is ambiguous"));
+    }
+    let session_id = session.get::<String>(0)?;
+    let events = remote_event_rows(
+        &conn,
+        &format!(
+            "SELECT e.id, e.session_id, COALESCE(s.provider, 'unknown'), e.role, e.event_type, e.occurred_at_ms, e.payload_json \
+             FROM events e LEFT JOIN sessions s ON s.id = e.session_id \
+             WHERE e.session_id = {} AND e.deleted_at_ms IS NULL ORDER BY e.occurred_at_ms, e.seq",
+            sql_text_literal(&session_id)
+        ),
+    )
+    .await?;
+    Ok(json!({
+        "remote_primary": true,
+        "session": {
+            "id": session_id,
+            "provider": session.get::<String>(1)?,
+            "external_session_id": session.get::<Option<String>>(2)?,
+            "started_at_ms": session.get::<i64>(3)?,
+            "ended_at_ms": session.get::<Option<i64>>(4)?,
+        },
+        "events": events,
+    }))
+}
+
+async fn remote_snapshot_event(id: &str) -> Result<serde_json::Value> {
+    let conn = connect().await?;
+    let events = remote_event_rows(
+        &conn,
+        &format!(
+            "SELECT e.id, e.session_id, COALESCE(s.provider, 'unknown'), e.role, e.event_type, e.occurred_at_ms, e.payload_json \
+             FROM events e LEFT JOIN sessions s ON s.id = e.session_id \
+             WHERE {} AND e.deleted_at_ms IS NULL LIMIT 2",
+            remote_id_match("e.id", id)
+        ),
+    )
+    .await?;
+    match events.as_slice() {
+        [] => Err(anyhow!("remote ctx event {id} was not found")),
+        [event] => Ok(json!({"remote_primary": true, "event": event})),
+        _ => Err(anyhow!("remote ctx event id prefix {id} is ambiguous")),
+    }
+}
+
+fn remote_id_match(column: &str, id: &str) -> String {
+    if uuid::Uuid::parse_str(id).is_ok() {
+        format!("{column} = {}", sql_text_literal(id))
+    } else {
+        format!("{column} LIKE {}", sql_text_literal(&format!("{id}%")))
+    }
+}
+
+async fn remote_event_rows(conn: &libsql::Connection, sql: &str) -> Result<Vec<serde_json::Value>> {
+    let mut rows = conn
+        .query(sql, ())
+        .await
+        .context("read remote ctx events")?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().await.context("read remote ctx event row")? {
+        let payload_json = row.get::<String>(6)?;
+        events.push(json!({
+            "event_id": row.get::<String>(0)?,
+            "session_id": row.get::<Option<String>>(1)?,
+            "provider": row.get::<String>(2)?,
+            "role": row.get::<Option<String>>(3)?,
+            "event_type": row.get::<String>(4)?,
+            "occurred_at_ms": row.get::<i64>(5)?,
+            "payload": serde_json::from_str::<serde_json::Value>(&payload_json).unwrap_or_else(|_| json!({"raw": payload_json})),
+        }));
+    }
+    Ok(events)
+}
+
+async fn has_projection(conn: &libsql::Connection) -> Result<bool> {
+    Ok(conn
+        .query("SELECT 1 FROM ctx_turso_events LIMIT 1", ())
+        .await
+        .is_ok())
+}
+
+fn print_remote_search_text(value: &serde_json::Value) {
+    let Some(results) = value.get("results").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if results.is_empty() {
+        println!("no remote results");
+        return;
+    }
+    for (index, result) in results.iter().enumerate() {
+        let provider = result
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let event_type = result
+            .get("event_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("event");
+        let event_id = result
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        println!("{}. {provider} {event_type} {event_id}", index + 1);
+    }
+}
+
+fn write_remote_show(
+    value: &serde_json::Value,
+    format: OutputFormat,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let rendered = match format {
+        OutputFormat::Json | OutputFormat::Jsonl => serde_json::to_string_pretty(value)?,
+        OutputFormat::Text | OutputFormat::Markdown => serde_json::to_string_pretty(value)?,
+    };
+    if let Some(path) = out {
+        std::fs::write(path, format!("{rendered}\n"))?;
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+async fn remote_status_value() -> Result<serde_json::Value> {
+    let conn = connect().await?;
+    let layout = remote_layout(&conn).await?;
+    if matches!(layout, RemoteLayout::Snapshot) {
+        let schema_version =
+            remote_scalar_i64(&conn, "PRAGMA user_version", "schema version").await?;
+        return Ok(json!({
+            "remote_primary": true,
+            "storage_layout": "imported_sqlite_snapshot",
+            "schema_version": schema_version,
+        }));
+    }
+    Err(anyhow!(
+        "remote-primary requires an imported ctx SQLite snapshot"
+    ))
+}
+
 async fn status(json_output: bool) -> Result<()> {
     let conn = connect().await?;
     let layout = remote_layout(&conn).await?;
@@ -721,15 +1096,17 @@ fn fts_match_query(query: &str) -> String {
 }
 
 async fn remote_layout(conn: &libsql::Connection) -> Result<RemoteLayout> {
+    // A snapshot is authoritative. A leftover projection is only a derived cache and may be
+    // partial after an interrupted build.
+    if has_imported_snapshot(conn).await? {
+        return Ok(RemoteLayout::Snapshot);
+    }
     if conn
         .query("SELECT 1 FROM ctx_turso_events LIMIT 1", ())
         .await
         .is_ok()
     {
         return Ok(RemoteLayout::Projection);
-    }
-    if has_imported_snapshot(conn).await? {
-        return Ok(RemoteLayout::Snapshot);
     }
     Err(anyhow!(
         "remote database is neither a ctx Turso projection nor an imported ctx SQLite snapshot"
@@ -793,7 +1170,7 @@ mod tests {
         assert_eq!(parse_push_batch_size("1"), Ok(1));
         assert_eq!(parse_push_batch_size("250"), Ok(250));
         assert!(parse_push_batch_size("0").is_err());
-        assert!(parse_push_batch_size("251").is_err());
+        assert!(parse_push_batch_size("1001").is_err());
     }
 
     #[test]

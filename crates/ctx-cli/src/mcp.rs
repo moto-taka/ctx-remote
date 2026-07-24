@@ -266,7 +266,7 @@ fn initialize_result(params: &Value) -> Value {
             "name": "ctx",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Read-only access to the local ctx index. Tool output may include absolute paths, source metadata, snippets, transcript text, and raw SQL query results; MCP hosts may log or forward it. This minimal server supports initialize, ping, tools/list, and tools/call over newline-delimited stdio. It does not expose MCP resources or prompts, and tools do not import provider history, write provider files, or write repositories."
+        "instructions": "Read-only access to the configured ctx history. Tool output may include absolute paths, source metadata, snippets, transcript text, and raw SQL query results; MCP hosts may log or forward it. This minimal server supports initialize, ping, tools/list, and tools/call over newline-delimited stdio. It does not expose MCP resources or prompts, and tools do not import provider history, write provider files, or write repositories."
     })
 }
 
@@ -374,6 +374,9 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
 }
 
 fn tool_status(data_root: &Path) -> Result<Value> {
+    if crate::commands::turso::remote_primary_configured() {
+        return crate::commands::turso::remote_primary_status_value();
+    }
     let db_path = database_path(data_root.to_path_buf());
     let initialized = db_path.exists();
     let config = config::AppConfig::load(data_root)?;
@@ -521,6 +524,34 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     }) {
         return Err(anyhow!("search needs a query or file"));
     }
+    if crate::commands::turso::remote_primary_configured() {
+        if history_source.is_some()
+            || provider_key.is_some()
+            || source_id.is_some()
+            || source_format.is_some()
+            || workspace.is_some()
+            || since.is_some()
+            || primary_only
+            || include_subagents
+            || file.is_some()
+            || optional_bool(arguments, "include_current_session")?.unwrap_or(false)
+            || matches!(
+                optional_search_backend(arguments, "backend")?,
+                Some(SearchBackendArg::Hybrid | SearchBackendArg::Semantic)
+            )
+        {
+            return Err(anyhow!(
+                "this MCP search filter is not available in remote-primary mode yet"
+            ));
+        }
+        return crate::commands::turso::remote_primary_search_value(
+            query,
+            limit,
+            provider.map(|provider| provider.capture_provider().as_str().to_owned()),
+            session,
+            event_type,
+        );
+    }
     let store = open_existing_store(data_root)?;
     let events = optional_bool(arguments, "events")?.unwrap_or(false) || session.is_some();
     let include_current_session =
@@ -605,6 +636,13 @@ fn tool_sql(arguments: &Value, data_root: &Path) -> Result<Value> {
 }
 
 fn tool_show_session(arguments: &Value, data_root: &Path) -> Result<Value> {
+    if crate::commands::turso::remote_primary_configured() {
+        return crate::commands::turso::remote_primary_session_value(
+            required_uuid(arguments, "ctx_session_id")?
+                .to_string()
+                .as_str(),
+        );
+    }
     let store = open_existing_store(data_root)?;
     let session_id = required_uuid(arguments, "ctx_session_id")?;
     let mode = optional_transcript_mode(arguments, "mode")?.unwrap_or(TranscriptMode::Lite);
@@ -630,6 +668,13 @@ fn tool_show_session(arguments: &Value, data_root: &Path) -> Result<Value> {
 }
 
 fn tool_show_event(arguments: &Value, data_root: &Path) -> Result<Value> {
+    if crate::commands::turso::remote_primary_configured() {
+        return crate::commands::turso::remote_primary_event_value(
+            required_uuid(arguments, "ctx_event_id")?
+                .to_string()
+                .as_str(),
+        );
+    }
     let store = open_existing_store(data_root)?;
     let event_id = required_uuid(arguments, "ctx_event_id")?;
     let before = optional_usize(arguments, "before")?.unwrap_or(0);
