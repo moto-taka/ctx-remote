@@ -99,6 +99,8 @@ struct TursoImportArgs {
         help = "Number of events per remote transaction (1-1000)"
     )]
     batch_size: usize,
+    #[arg(long, value_enum, hide_possible_values = true)]
+    provider: Option<crate::NativeProviderArg>,
     #[arg(long)]
     json: bool,
 }
@@ -278,17 +280,38 @@ pub(crate) fn remote_primary_event_value(id: &str) -> Result<serde_json::Value> 
 }
 
 fn run_turso_import(args: TursoImportArgs) -> Result<()> {
-    let (store, totals) = crate::commands::import::import_all_providers_in_memory()?;
-    let report = run_async(push(
-        store,
-        TursoPushArgs {
-            batch_size: args.batch_size,
-            limit: None,
-            after_event_id: None,
-            include_local_only: true,
-            json: args.json,
+    let mut report = TursoPushReport {
+        uploaded_events: 0,
+        skipped_events: 0,
+        scanned_events: 0,
+        batches: 0,
+    };
+    let totals = crate::commands::import::import_all_providers_in_memory_by_source(
+        args.provider,
+        |store| {
+            let source_report = run_async(push(
+                store,
+                TursoPushArgs {
+                    batch_size: args.batch_size,
+                    limit: None,
+                    after_event_id: None,
+                    include_local_only: true,
+                    json: args.json,
+                },
+            ))?;
+            report.uploaded_events = report
+                .uploaded_events
+                .saturating_add(source_report.uploaded_events);
+            report.skipped_events = report
+                .skipped_events
+                .saturating_add(source_report.skipped_events);
+            report.scanned_events = report
+                .scanned_events
+                .saturating_add(source_report.scanned_events);
+            report.batches = report.batches.saturating_add(source_report.batches);
+            Ok(())
         },
-    ))?;
+    )?;
     if args.json {
         print_json(json!({
             "ephemeral_store": true,
@@ -382,6 +405,46 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<()> {
     )
     .await
     .context("create Turso dedupe index")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ctx_turso_event_keys (\
+            dedupe_key TEXT PRIMARY KEY,\
+            event_id TEXT NOT NULL\
+        )",
+        (),
+    )
+    .await
+    .context("create Turso cross-device event key table")?;
+    Ok(())
+}
+
+async fn ensure_remote_event_keys(conn: &libsql::Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) \
+         SELECT dedupe_key, event_id FROM ctx_turso_events WHERE dedupe_key IS NOT NULL",
+        (),
+    )
+    .await
+    .context("backfill Turso projection event keys")?;
+    if !has_imported_snapshot(conn).await? {
+        return Ok(());
+    }
+    // Legacy ctx stores identify the same provider event with a source-local UUID. Convert that
+    // key to the stable provider-session form before importing from another Mac.
+    conn.execute(
+        "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) \
+         SELECT 'provider:' || s.provider || ':' || s.external_session_id || ':' || \
+                substr(e.dedupe_key, length('provider-source:') + \
+                    instr(substr(e.dedupe_key, length('provider-source:') + 1), ':') + 1), \
+                e.id \
+         FROM events e JOIN sessions s ON s.id = e.session_id \
+         WHERE e.dedupe_key LIKE 'provider-source:%' \
+           AND s.external_session_id IS NOT NULL \
+           AND trim(s.external_session_id) <> '' \
+           AND instr(substr(e.dedupe_key, length('provider-source:') + 1), ':') > 0",
+        (),
+    )
+    .await
+    .context("backfill imported snapshot cross-device event keys")?;
     Ok(())
 }
 
@@ -474,6 +537,7 @@ async fn ensure_dedupe_key_column(conn: &libsql::Connection) -> Result<()> {
 async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
     let conn = connect().await?;
     ensure_schema(&conn).await?;
+    ensure_remote_event_keys(&conn).await?;
     let session_identities = store
         .list_sessions()?
         .into_iter()
@@ -513,6 +577,15 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
         scanned += events.len();
         after_id = Some(last.id);
 
+        let known_dedupe_keys = remote_existing_dedupe_keys(
+            &conn,
+            events
+                .iter()
+                .filter_map(|event| remote_dedupe_key(event, &session_identities))
+                .collect(),
+        )
+        .await?;
+
         let mut sql = String::new();
         let mut exported_statements = 0usize;
         for event in &events {
@@ -533,9 +606,28 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
                 .map(String::as_str)
                 .unwrap_or("unknown");
             let dedupe_key = remote_dedupe_key(event, &session_identities);
+            if dedupe_key
+                .as_ref()
+                .is_some_and(|key| known_dedupe_keys.contains(key))
+            {
+                skipped += 1;
+                continue;
+            }
+            let event_id = event.id.to_string();
+            let event_id_literal = sql_text_literal(&event_id);
+            if let Some(dedupe_key) = dedupe_key.as_deref() {
+                sql.push_str(
+                    "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) VALUES (",
+                );
+                sql.push_str(sql_text_literal(dedupe_key).as_str());
+                sql.push(',');
+                sql.push_str(event_id_literal.as_str());
+                sql.push_str(");");
+            }
             sql.push_str("INSERT OR IGNORE INTO ctx_turso_events \
-                (event_id, session_id, provider, role, event_type, occurred_at_ms, dedupe_key, payload_json, search_text) VALUES (");
-            sql.push_str(sql_text_literal(event.id.to_string().as_str()).as_str());
+                (event_id, session_id, provider, role, event_type, occurred_at_ms, dedupe_key, payload_json, search_text) \
+                SELECT ");
+            sql.push_str(event_id_literal.as_str());
             sql.push(',');
             push_optional_sql_text_literal(&mut sql, event.session_id.map(|id| id.to_string()));
             sql.push(',');
@@ -550,26 +642,35 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
             sql.push(',');
             sql.push_str(event.occurred_at.timestamp_millis().to_string().as_str());
             sql.push(',');
-            push_optional_sql_text_literal(&mut sql, dedupe_key);
+            push_optional_sql_text_literal(&mut sql, dedupe_key.clone());
             sql.push(',');
             sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
             sql.push(',');
             sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
-            sql.push_str(");");
+            if let Some(dedupe_key) = dedupe_key.as_deref() {
+                sql.push_str(
+                    " WHERE (SELECT event_id FROM ctx_turso_event_keys WHERE dedupe_key = ",
+                );
+                sql.push_str(sql_text_literal(dedupe_key).as_str());
+                sql.push_str(") = ");
+                sql.push_str(event_id_literal.as_str());
+            }
+            sql.push_str(";");
             // FTS5 has no unique event-id constraint. Replace this document in the same remote
             // transaction so retries remain idempotent and newly imported events are searchable.
             sql.push_str("DELETE FROM ctx_turso_search WHERE event_id = ");
-            sql.push_str(sql_text_literal(event.id.to_string().as_str()).as_str());
+            sql.push_str(event_id_literal.as_str());
             sql.push_str(";");
-            sql.push_str("INSERT INTO ctx_turso_search(event_id, search_text) VALUES (");
-            sql.push_str(sql_text_literal(event.id.to_string().as_str()).as_str());
+            sql.push_str("INSERT INTO ctx_turso_search(event_id, search_text) SELECT ");
+            sql.push_str(event_id_literal.as_str());
             sql.push(',');
             sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
+            sql.push_str(" WHERE EXISTS (SELECT 1 FROM ctx_turso_events WHERE event_id = ");
+            sql.push_str(event_id_literal.as_str());
             sql.push_str(");");
             exported_statements += 1;
         }
         if exported_statements > 0 {
-            let before_changes = conn.total_changes();
             tokio::time::timeout(
                 REMOTE_WRITE_TIMEOUT,
                 conn.execute_transactional_batch(sql.as_str()),
@@ -583,8 +684,7 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
                 )
             })?
             .context("upload Turso event batch")?;
-            let after_changes = conn.total_changes();
-            uploaded += after_changes.saturating_sub(before_changes);
+            uploaded += exported_statements as u64;
         }
         batches += 1;
     }
@@ -595,6 +695,35 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
         scanned_events: scanned,
         batches,
     })
+}
+
+async fn remote_existing_dedupe_keys(
+    conn: &libsql::Connection,
+    keys: Vec<String>,
+) -> Result<std::collections::HashSet<String>> {
+    if keys.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut unique = keys;
+    unique.sort();
+    unique.dedup();
+    let sql = format!(
+        "SELECT dedupe_key FROM ctx_turso_event_keys WHERE dedupe_key IN ({})",
+        unique
+            .iter()
+            .map(|key| sql_text_literal(key))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut rows = conn
+        .query(&sql, ())
+        .await
+        .context("read Turso cross-device event keys")?;
+    let mut existing = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await.context("read Turso event key")? {
+        existing.insert(row.get::<String>(0)?);
+    }
+    Ok(existing)
 }
 
 fn sql_text_literal(value: &str) -> String {
@@ -867,7 +996,7 @@ async fn remote_snapshot_session(id: &str) -> Result<serde_json::Value> {
     );
     let mut sessions = conn.query(&session_sql, ()).await?;
     let Some(session) = sessions.next().await? else {
-        return Err(anyhow!("remote ctx session {id} was not found"));
+        return remote_projection_session(&conn, id).await;
     };
     if sessions.next().await?.is_some() {
         return Err(anyhow!("remote ctx session id prefix {id} is ambiguous"));
@@ -905,6 +1034,67 @@ async fn remote_snapshot_event(id: &str) -> Result<serde_json::Value> {
              FROM events e LEFT JOIN sessions s ON s.id = e.session_id \
              WHERE {} AND e.deleted_at_ms IS NULL LIMIT 2",
             remote_id_match("e.id", id)
+        ),
+    )
+    .await?;
+    match events.as_slice() {
+        [] => remote_projection_event(&conn, id).await,
+        [event] => Ok(json!({"remote_primary": true, "event": event})),
+        _ => Err(anyhow!("remote ctx event id prefix {id} is ambiguous")),
+    }
+}
+
+async fn remote_projection_session(
+    conn: &libsql::Connection,
+    id: &str,
+) -> Result<serde_json::Value> {
+    if !has_projection(conn).await? {
+        return Err(anyhow!("remote ctx session {id} was not found"));
+    }
+    let session_match = remote_id_match("session_id", id);
+    let metadata_sql = format!(
+        "SELECT session_id, MIN(provider), MIN(occurred_at_ms), MAX(occurred_at_ms) \
+         FROM ctx_turso_events WHERE {session_match} GROUP BY session_id LIMIT 2"
+    );
+    let mut sessions = conn.query(&metadata_sql, ()).await?;
+    let Some(session) = sessions.next().await? else {
+        return Err(anyhow!("remote ctx session {id} was not found"));
+    };
+    if sessions.next().await?.is_some() {
+        return Err(anyhow!("remote ctx session id prefix {id} is ambiguous"));
+    }
+    let session_id = session.get::<String>(0)?;
+    let events = remote_event_rows(
+        conn,
+        &format!(
+            "SELECT event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json \
+             FROM ctx_turso_events WHERE session_id = {} ORDER BY occurred_at_ms, event_id",
+            sql_text_literal(&session_id)
+        ),
+    )
+    .await?;
+    Ok(json!({
+        "remote_primary": true,
+        "session": {
+            "id": session_id,
+            "provider": session.get::<String>(1)?,
+            "started_at_ms": session.get::<i64>(2)?,
+            "ended_at_ms": session.get::<i64>(3)?,
+        },
+        "events": events,
+    }))
+}
+
+async fn remote_projection_event(conn: &libsql::Connection, id: &str) -> Result<serde_json::Value> {
+    if !has_projection(conn).await? {
+        return Err(anyhow!("remote ctx event {id} was not found"));
+    }
+    let events = remote_event_rows(
+        conn,
+        &format!(
+            "SELECT event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json \
+             FROM ctx_turso_events WHERE {} LIMIT 2",
+            remote_id_match("event_id", id)
         ),
     )
     .await?;

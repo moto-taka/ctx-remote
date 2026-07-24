@@ -12,12 +12,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use ctx_history_capture::{
-    catalog_codex_session_tree, import_antigravity_cli_history, import_astrbot_sqlite,
-    import_auggie_history, import_claude_projects_jsonl_tree, import_cline_task_json_history,
-    import_codebuddy_history, import_codex_history_jsonl, import_codex_session_jsonl,
-    import_codex_session_jsonl_tail, import_codex_session_paths, import_codex_session_tree,
-    import_continue_cli_sessions, import_copilot_cli_session_events, import_crush_sqlite,
-    import_cursor_native_history, import_custom_history_jsonl_v1,
+    catalog_codex_session_tree, codex_session_paths, import_antigravity_cli_history,
+    import_astrbot_sqlite, import_auggie_history, import_claude_projects_jsonl_tree,
+    import_cline_task_json_history, import_codebuddy_history, import_codex_history_jsonl,
+    import_codex_session_jsonl, import_codex_session_jsonl_tail, import_codex_session_paths,
+    import_codex_session_tree, import_continue_cli_sessions, import_copilot_cli_session_events,
+    import_crush_sqlite, import_cursor_native_history, import_custom_history_jsonl_v1,
     import_custom_history_jsonl_v1_reader, import_deepagents_sqlite,
     import_factory_ai_droid_sessions, import_firebender_sqlite, import_forgecode_sqlite,
     import_gemini_cli_history, import_goose_sessions_sqlite, import_hermes_sqlite,
@@ -62,7 +62,7 @@ use crate::output::print_json;
 use crate::progress::{
     format_bytes, format_count, plural, ProgressArg, ProgressReporter, SourceProgressSnapshot,
 };
-use crate::provider_args::ImportFormatArg;
+use crate::provider_args::{ImportFormatArg, NativeProviderArg};
 use crate::provider_sources::{
     discovered_sources, discovered_sources_for_provider, explicit_path_source, import_support_json,
     SourceInfo,
@@ -973,13 +973,19 @@ pub(crate) fn run_import_internal(
     })
 }
 
-/// Imports every discovered native provider into a process-memory Store. The
-/// caller owns the Store and must persist its accepted records before dropping
-/// it. This path deliberately has no data root, catalog files, spool, or
-/// SQLite database file.
-pub(crate) fn import_all_providers_in_memory() -> Result<(Store, ImportTotals)> {
+/// Imports one discovered provider source at a time into a process-memory Store and passes that
+/// Store to `persist` before dropping it. This is the zero-persistent-storage import boundary
+/// used by remote-primary backends: a provider source never needs a `work.sqlite` file and one
+/// source cannot retain records from a previously processed source.
+pub(crate) fn import_all_providers_in_memory_by_source<F>(
+    provider: Option<NativeProviderArg>,
+    mut persist: F,
+) -> Result<ImportTotals>
+where
+    F: FnMut(Store) -> Result<()>,
+{
     let args = ImportArgs {
-        provider: None,
+        provider,
         path: None,
         history_source: None,
         history_source_manifest: Vec::new(),
@@ -992,14 +998,24 @@ pub(crate) fn import_all_providers_in_memory() -> Result<(Store, ImportTotals)> 
         progress: ProgressArg::None,
     };
     let requests = import_requests(&args)?;
-    let mut store = Store::open_in_memory()?;
-    let inventory = inventory_import_sources(&store, requests, true)?;
-    let mut totals = ImportTotals::default();
+    let inventory_store = Store::open_in_memory()?;
+    let inventory = inventory_import_sources(&inventory_store, requests, true)?;
+    drop(inventory_store);
 
+    let mut totals = ImportTotals::default();
     for failure in inventory.failures {
         totals.add_source_failure(&failure.stats);
     }
     for plan in inventory.sources {
+        if plan.source.provider == CaptureProvider::Codex
+            && plan.source.source_format == "codex_session_jsonl_tree"
+            && plan.source.path.is_dir()
+        {
+            let summary = import_codex_tree_in_memory_chunks(&plan.source, &mut persist)?;
+            totals.add(&summary, &plan.stats);
+            continue;
+        }
+        let mut store = Store::open_in_memory()?;
         match import_one_source_without_search_refresh(
             &mut store,
             &plan.source,
@@ -1007,14 +1023,48 @@ pub(crate) fn import_all_providers_in_memory() -> Result<(Store, ImportTotals)> 
             true,
             &plan.preinventory,
         ) {
-            Ok(summary) => totals.add(&summary, &plan.stats),
+            Ok(summary) => {
+                persist(store)?;
+                totals.add(&summary, &plan.stats);
+            }
             Err(error) if import_error_scope(&error) == ImportFailureScope::Source => {
                 totals.add_source_failure(&plan.stats);
             }
             Err(error) => return Err(error),
         }
     }
-    Ok((store, totals))
+    Ok(totals)
+}
+
+const REMOTE_IN_MEMORY_CODEX_SESSION_BATCH_SIZE: usize = 8;
+
+fn import_codex_tree_in_memory_chunks<F>(
+    source: &SourceInfo,
+    persist: &mut F,
+) -> Result<ProviderImportSummary>
+where
+    F: FnMut(Store) -> Result<()>,
+{
+    let paths = codex_session_paths(&source.path)?;
+    let record = import_record_for_source(source);
+    let mut merged = ProviderImportSummary::default();
+    for paths in paths.chunks(REMOTE_IN_MEMORY_CODEX_SESSION_BATCH_SIZE) {
+        let mut store = Store::open_in_memory()?;
+        store.upsert_record(&record)?;
+        let summary = import_codex_session_paths(
+            paths.to_vec(),
+            &mut store,
+            CodexSessionImportOptions {
+                source_path: Some(source.path.clone()),
+                history_record_id: Some(record.id),
+                ..CodexSessionImportOptions::default()
+            },
+        )
+        .map_err(anyhow::Error::from)?;
+        persist(store)?;
+        merged.merge_from(summary);
+    }
+    Ok(merged)
 }
 
 fn source_provider_label(source: &SourceInfo) -> &'static str {

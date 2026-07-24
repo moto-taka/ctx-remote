@@ -758,6 +758,15 @@ pub fn import_codex_session_tree(
     import_codex_session_paths_parallel_normalized(paths, store, options, skipped_by_bounds)
 }
 
+/// Lists the transcript files that make up a Codex session tree. Remote-primary import uses this
+/// to keep its ephemeral staging store bounded to a small group of sessions at a time.
+pub fn codex_session_paths(root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_jsonl_paths(root.as_ref(), &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
 fn codex_common_source_root(paths: &[PathBuf]) -> Option<PathBuf> {
     let mut parents = paths.iter().filter_map(|path| path.parent());
     let mut root = parents.next()?.to_path_buf();
