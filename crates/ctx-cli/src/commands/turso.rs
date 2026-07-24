@@ -12,7 +12,7 @@ use crate::{output::print_json, store_util::open_existing_store_read_only};
 const DATABASE_URL_ENV: &str = "CTX_TURSO_DATABASE_URL";
 const AUTH_TOKEN_ENV: &str = "CTX_TURSO_AUTH_TOKEN";
 const DEFAULT_PUSH_BATCH_SIZE: usize = 100;
-const MAX_PUSH_BATCH_SIZE: usize = 250;
+const MAX_PUSH_BATCH_SIZE: usize = 1000;
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 200;
 const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
