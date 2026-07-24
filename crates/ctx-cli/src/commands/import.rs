@@ -979,15 +979,16 @@ pub(crate) fn run_import_internal(
 /// source cannot retain records from a previously processed source.
 pub(crate) fn import_all_providers_in_memory_by_source<F>(
     provider: Option<NativeProviderArg>,
+    path: Option<PathBuf>,
     mut persist: F,
 ) -> Result<ImportTotals>
 where
     F: FnMut(Store) -> Result<()>,
 {
-    let all = provider.is_none();
+    let all = provider.is_none() && path.is_none();
     let args = ImportArgs {
         provider,
-        path: None,
+        path,
         history_source: None,
         history_source_manifest: Vec::new(),
         reset_cursor: false,

@@ -101,6 +101,8 @@ struct TursoImportArgs {
     batch_size: usize,
     #[arg(long, value_enum, hide_possible_values = true)]
     provider: Option<crate::NativeProviderArg>,
+    #[arg(long, requires = "provider", help = "Import one provider history path")]
+    path: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -288,6 +290,7 @@ fn run_turso_import(args: TursoImportArgs) -> Result<()> {
     };
     let totals = crate::commands::import::import_all_providers_in_memory_by_source(
         args.provider,
+        args.path,
         |store| {
             let source_report = run_async(push(
                 store,
