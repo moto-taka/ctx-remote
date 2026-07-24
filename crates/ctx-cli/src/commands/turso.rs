@@ -167,6 +167,14 @@ pub(crate) fn run_turso(args: TursoArgs, data_root: PathBuf) -> Result<()> {
     }
 }
 
+pub(crate) fn remote_primary_configured() -> bool {
+    env::var_os(DATABASE_URL_ENV).is_some()
+}
+
+pub(crate) fn run_remote_primary_status(json_output: bool) -> Result<()> {
+    run_async(status(json_output))
+}
+
 fn run_turso_import(args: TursoImportArgs) -> Result<()> {
     let (store, totals) = crate::commands::import::import_all_providers_in_memory()?;
     let report = run_async(push(

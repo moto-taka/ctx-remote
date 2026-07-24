@@ -711,6 +711,9 @@ fn main() -> Result<()> {
             quiet,
             &config,
         ),
+        CommandRoot::Status(args) if commands::turso::remote_primary_configured() => {
+            commands::turso::run_remote_primary_status(args.json)
+        }
         CommandRoot::Status(args) => run_status(args, data_root.clone(), quiet),
         CommandRoot::Index(args) => run_index(args, data_root.clone(), quiet),
         CommandRoot::Sources(args) => {
