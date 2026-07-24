@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
@@ -15,6 +15,7 @@ const DEFAULT_PUSH_BATCH_SIZE: usize = 100;
 const MAX_PUSH_BATCH_SIZE: usize = 250;
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 200;
+const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Args)]
 pub(crate) struct TursoArgs {
@@ -67,6 +68,11 @@ struct TursoPushArgs {
     batch_size: usize,
     #[arg(long, help = "Upload no more than this many events")]
     limit: Option<usize>,
+    #[arg(
+        long,
+        help = "Resume one interrupted upload after this event UUID; use only with the same unchanged local index"
+    )]
+    after_event_id: Option<uuid::Uuid>,
     #[arg(
         long,
         help = "Also export local-only events; required unless events are marked sync_full"
@@ -162,6 +168,7 @@ fn run_turso_import(args: TursoImportArgs) -> Result<()> {
         TursoPushArgs {
             batch_size: args.batch_size,
             limit: None,
+            after_event_id: None,
             include_local_only: true,
             json: args.json,
         },
@@ -297,7 +304,7 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
         .map(|source| (source.id, source.descriptor.provider.as_str().to_owned()))
         .collect::<std::collections::HashMap<_, _>>();
 
-    let mut after_id = None;
+    let mut after_id = args.after_event_id;
     let mut uploaded = 0u64;
     let mut skipped = 0usize;
     let mut scanned = 0usize;
@@ -339,8 +346,9 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
                 .map(String::as_str)
                 .unwrap_or("unknown");
             let dedupe_key = remote_dedupe_key(event, &session_identities);
-            uploaded += transaction
-                .execute(
+            let changed = tokio::time::timeout(
+                REMOTE_WRITE_TIMEOUT,
+                transaction.execute(
                     "INSERT OR IGNORE INTO ctx_turso_events \
                      (event_id, session_id, provider, role, event_type, occurred_at_ms, dedupe_key, payload_json, search_text) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -355,13 +363,27 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
                         payload_json,
                         "",
                     ],
-                )
-                .await
-                .with_context(|| format!("upload event {}", event.id))?;
-        }
-        transaction
-            .commit()
+                ),
+            )
             .await
+            .with_context(|| {
+                format!(
+                    "upload event {} timed out after {} seconds",
+                    event.id,
+                    REMOTE_WRITE_TIMEOUT.as_secs()
+                )
+            })?
+            .with_context(|| format!("upload event {}", event.id))?;
+            uploaded += changed;
+        }
+        tokio::time::timeout(REMOTE_WRITE_TIMEOUT, transaction.commit())
+            .await
+            .with_context(|| {
+                format!(
+                    "commit Turso upload transaction timed out after {} seconds",
+                    REMOTE_WRITE_TIMEOUT.as_secs()
+                )
+            })?
             .context("commit Turso upload transaction")?;
         batches += 1;
     }

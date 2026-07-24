@@ -67,6 +67,10 @@ shipped.
   the complete event set on each execution to guarantee that UUID sort order
   cannot lose newly imported history. It does not yet stream normalized records
   directly to libSQL or maintain a remote per-source incremental cursor.
+- Remote writes time out after one minute rather than waiting indefinitely. An
+  interrupted upload can be restarted with its last successfully uploaded event
+  UUID through the explicit `--after-event-id` recovery option, provided the
+  local index is unchanged.
 - `ctx turso push` uploads an existing local index. Neither command makes the
   ordinary local `ctx search`, `show`, SQL, MCP, semantic retrieval, or
   artifact-body interfaces remote-capable; use `ctx turso search` for remote

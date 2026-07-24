@@ -48,6 +48,9 @@ ctx turso status
   default; use `--include-local-only` to make exporting ordinary local history
   an intentional action. Event UUID and provider dedupe keys make replaying a
   push and independently uploading matching history from a second Mac safe.
+  `--after-event-id <UUID>` is an explicit recovery option for an interrupted
+  upload of the same unchanged local index; normal uploads always scan the
+  complete index so newly created non-monotonic UUIDs are not skipped.
 - `import` reads every discovered native provider directly into a process-memory
   ctx store, then uploads it to Turso. It never creates a persistent ctx
   `work.sqlite`, WAL, `objects`, or `spool` directory. The transient store is
