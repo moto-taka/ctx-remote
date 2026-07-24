@@ -26,6 +26,14 @@ fn in_memory_store_uses_no_filesystem_database_path() {
     assert!(store.object_dir.as_os_str().is_empty());
 }
 
+#[test]
+fn in_memory_bulk_search_mode_never_opens_a_sidecar_database() {
+    let store = Store::open_in_memory().unwrap();
+    let guard = store.begin_event_search_bulk_mode().unwrap();
+    assert!(!guard.has_lock_connection());
+    store.finish_event_search_bulk_mode(&guard).unwrap();
+}
+
 fn fts_config(store: &Store, table: &str, key: &str, default: i64) -> i64 {
     let sql = format!("SELECT v FROM {table}_config WHERE k = ?1");
     store

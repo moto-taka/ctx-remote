@@ -55,6 +55,13 @@ pub struct EventSearchBulkGuard {
     depth_counted: bool,
 }
 
+#[cfg(test)]
+impl EventSearchBulkGuard {
+    pub(crate) fn has_lock_connection(&self) -> bool {
+        self.lock_conn.is_some()
+    }
+}
+
 impl Drop for EventSearchBulkGuard {
     fn drop(&mut self) {
         if let Some(lock_conn) = &self.lock_conn {
@@ -69,6 +76,15 @@ impl Drop for EventSearchBulkGuard {
 impl Store {
     /// Acquire the bulk-import lock and persist merge suppression.
     pub fn begin_event_search_bulk_mode(&self) -> Result<EventSearchBulkGuard> {
+        if self.path == PathBuf::from(":memory:") {
+            self.event_search_bulk_depth.fetch_add(1, Ordering::SeqCst);
+            return Ok(EventSearchBulkGuard {
+                lock_conn: None,
+                store_path: self.path.clone(),
+                depth: Arc::clone(&self.event_search_bulk_depth),
+                depth_counted: true,
+            });
+        }
         if self.event_search_bulk_depth.fetch_add(1, Ordering::SeqCst) > 0 {
             return Ok(EventSearchBulkGuard {
                 lock_conn: None,

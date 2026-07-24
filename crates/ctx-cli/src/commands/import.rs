@@ -984,6 +984,7 @@ pub(crate) fn import_all_providers_in_memory_by_source<F>(
 where
     F: FnMut(Store) -> Result<()>,
 {
+    let all = provider.is_none();
     let args = ImportArgs {
         provider,
         path: None,
@@ -991,7 +992,7 @@ where
         history_source_manifest: Vec::new(),
         reset_cursor: false,
         format: None,
-        all: true,
+        all,
         resume: true,
         no_daemon: true,
         json: false,

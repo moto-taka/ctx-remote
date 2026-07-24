@@ -417,37 +417,6 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_remote_event_keys(conn: &libsql::Connection) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) \
-         SELECT dedupe_key, event_id FROM ctx_turso_events WHERE dedupe_key IS NOT NULL",
-        (),
-    )
-    .await
-    .context("backfill Turso projection event keys")?;
-    if !has_imported_snapshot(conn).await? {
-        return Ok(());
-    }
-    // Legacy ctx stores identify the same provider event with a source-local UUID. Convert that
-    // key to the stable provider-session form before importing from another Mac.
-    conn.execute(
-        "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) \
-         SELECT 'provider:' || s.provider || ':' || s.external_session_id || ':' || \
-                substr(e.dedupe_key, length('provider-source:') + \
-                    instr(substr(e.dedupe_key, length('provider-source:') + 1), ':') + 1), \
-                e.id \
-         FROM events e JOIN sessions s ON s.id = e.session_id \
-         WHERE e.dedupe_key LIKE 'provider-source:%' \
-           AND s.external_session_id IS NOT NULL \
-           AND trim(s.external_session_id) <> '' \
-           AND instr(substr(e.dedupe_key, length('provider-source:') + 1), ':') > 0",
-        (),
-    )
-    .await
-    .context("backfill imported snapshot cross-device event keys")?;
-    Ok(())
-}
-
 async fn project(args: TursoProjectArgs) -> Result<()> {
     let conn = connect().await?;
     if !has_imported_snapshot(&conn).await? {
@@ -537,7 +506,6 @@ async fn ensure_dedupe_key_column(conn: &libsql::Connection) -> Result<()> {
 async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
     let conn = connect().await?;
     ensure_schema(&conn).await?;
-    ensure_remote_event_keys(&conn).await?;
     let session_identities = store
         .list_sessions()?
         .into_iter()
@@ -577,14 +545,11 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
         scanned += events.len();
         after_id = Some(last.id);
 
-        let known_dedupe_keys = remote_existing_dedupe_keys(
-            &conn,
-            events
-                .iter()
-                .filter_map(|event| remote_dedupe_key(event, &session_identities))
-                .collect(),
-        )
-        .await?;
+        let dedupe_candidates = events
+            .iter()
+            .filter_map(|event| remote_dedupe_candidate(event, &session_identities))
+            .collect::<Vec<_>>();
+        let known_dedupe_keys = remote_existing_dedupe_keys(&conn, &dedupe_candidates).await?;
 
         let mut sql = String::new();
         let mut exported_statements = 0usize;
@@ -699,12 +664,15 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
 
 async fn remote_existing_dedupe_keys(
     conn: &libsql::Connection,
-    keys: Vec<String>,
+    candidates: &[RemoteDedupeCandidate],
 ) -> Result<std::collections::HashSet<String>> {
-    if keys.is_empty() {
+    if candidates.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let mut unique = keys;
+    let mut unique = candidates
+        .iter()
+        .map(|candidate| candidate.canonical.clone())
+        .collect::<Vec<_>>();
     unique.sort();
     unique.dedup();
     let sql = format!(
@@ -723,7 +691,124 @@ async fn remote_existing_dedupe_keys(
     while let Some(row) = rows.next().await.context("read Turso event key")? {
         existing.insert(row.get::<String>(0)?);
     }
+    if existing.len() == unique.len() || !has_imported_snapshot(conn).await? {
+        return Ok(existing);
+    }
+
+    let missing = candidates
+        .iter()
+        .filter(|candidate| !existing.contains(&candidate.canonical))
+        .collect::<Vec<_>>();
+    let predicates = missing
+        .iter()
+        .map(|candidate| {
+            format!(
+                "(s.provider = {} AND s.external_session_id = {} AND e.dedupe_key LIKE {} ESCAPE '\\')",
+                sql_text_literal(&candidate.provider),
+                sql_text_literal(&candidate.external_session_id),
+                sql_text_literal(&provider_source_dedupe_pattern(&candidate.source_dedupe_key))
+            )
+        })
+        .collect::<Vec<_>>();
+    if predicates.is_empty() {
+        return Ok(existing);
+    }
+    let raw_sql = format!(
+        "SELECT s.provider, s.external_session_id, e.dedupe_key, e.id \
+         FROM events e JOIN sessions s ON s.id = e.session_id WHERE {}",
+        predicates.join(" OR ")
+    );
+    let mut raw_rows = conn
+        .query(&raw_sql, ())
+        .await
+        .context("match imported snapshot events for remote dedupe")?;
+    let requested = missing
+        .iter()
+        .map(|candidate| candidate.canonical.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut matches = Vec::new();
+    while let Some(row) = raw_rows
+        .next()
+        .await
+        .context("read imported snapshot dedupe match")?
+    {
+        let provider = row.get::<String>(0)?;
+        let external_session_id = row.get::<String>(1)?;
+        let source_dedupe_key = row.get::<String>(2)?;
+        let Some(canonical) = canonical_provider_source_dedupe_key(
+            &provider,
+            Some(&external_session_id),
+            &source_dedupe_key,
+        ) else {
+            continue;
+        };
+        if requested.contains(canonical.as_str()) {
+            matches.push((canonical, row.get::<String>(3)?));
+        }
+    }
+    if !matches.is_empty() {
+        let mut write_sql = String::new();
+        for (canonical, event_id) in &matches {
+            write_sql.push_str(
+                "INSERT OR IGNORE INTO ctx_turso_event_keys(dedupe_key, event_id) VALUES (",
+            );
+            write_sql.push_str(&sql_text_literal(canonical));
+            write_sql.push(',');
+            write_sql.push_str(&sql_text_literal(event_id));
+            write_sql.push_str(");");
+            existing.insert(canonical.clone());
+        }
+        conn.execute_transactional_batch(&write_sql)
+            .await
+            .context("cache imported snapshot remote dedupe matches")?;
+    }
     Ok(existing)
+}
+
+#[derive(Clone)]
+struct RemoteDedupeCandidate {
+    canonical: String,
+    provider: String,
+    external_session_id: String,
+    source_dedupe_key: String,
+}
+
+fn remote_dedupe_candidate(
+    event: &ctx_history_core::Event,
+    sessions: &std::collections::HashMap<uuid::Uuid, (String, Option<String>)>,
+) -> Option<RemoteDedupeCandidate> {
+    let source_dedupe_key = event.dedupe_key.as_deref()?.to_owned();
+    let session_id = event.session_id?;
+    let (provider, external_session_id) = sessions.get(&session_id)?;
+    let external_session_id = external_session_id.as_deref()?.trim();
+    if external_session_id.is_empty() {
+        return None;
+    }
+    let canonical = canonical_provider_source_dedupe_key(
+        provider,
+        Some(external_session_id),
+        &source_dedupe_key,
+    )?;
+    Some(RemoteDedupeCandidate {
+        canonical,
+        provider: provider.clone(),
+        external_session_id: external_session_id.to_owned(),
+        source_dedupe_key,
+    })
+}
+
+fn provider_source_dedupe_pattern(source_dedupe_key: &str) -> String {
+    let suffix = source_dedupe_key
+        .strip_prefix("provider-source:")
+        .and_then(|value| value.split_once(':').map(|(_, suffix)| suffix))
+        .unwrap_or(source_dedupe_key);
+    format!(
+        "provider-source:%:{}",
+        suffix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
 }
 
 fn sql_text_literal(value: &str) -> String {
@@ -947,7 +1032,10 @@ async fn remote_snapshot_search(request: RemoteSearchRequest) -> Result<serde_js
     // `ctx turso import` writes portable events into the projection table. Keep those events
     // searchable while an imported snapshot remains the authoritative historical corpus.
     if !terms.is_empty() && has_projection(&conn).await? {
-        let mut projection_filters = vec!["raw_event.id IS NULL".to_owned()];
+        let mut projection_filters = vec![
+            "raw_event.id IS NULL".to_owned(),
+            "(p.dedupe_key IS NULL OR remote_key.event_id = p.event_id)".to_owned(),
+        ];
         if let Some(provider) = request.provider.as_deref() {
             projection_filters.push(format!("p.provider = {}", sql_text_literal(provider)));
         }
@@ -964,6 +1052,7 @@ async fn remote_snapshot_search(request: RemoteSearchRequest) -> Result<serde_js
             "SELECT p.event_id, p.session_id, p.provider, p.role, p.event_type, p.occurred_at_ms, p.payload_json \
              FROM ctx_turso_search JOIN ctx_turso_events p USING(event_id) \
              LEFT JOIN events raw_event ON raw_event.id = p.event_id \
+             LEFT JOIN ctx_turso_event_keys remote_key ON remote_key.dedupe_key = p.dedupe_key \
              WHERE ctx_turso_search MATCH {} AND {} ORDER BY p.occurred_at_ms DESC LIMIT {}",
             sql_text_literal(&terms.join(" OR ")),
             projection_filters.join(" AND "),
