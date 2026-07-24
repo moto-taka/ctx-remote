@@ -20,11 +20,12 @@ top-level `status`. `CTX_QUIET=1` provides the same default for scripts and
 installer wrappers. JSON output, errors, and command results from commands such
 as `search`, `show`, `sources`, and `docs` are not suppressed.
 
-## Remote libSQL / Turso (experimental)
+## Remote-primary libSQL / Turso
 
-`ctx turso` stores a portable event projection in a remote libSQL-compatible
-database. It is intended for sharing a history projection across machines; it
-does not alter the normal local `ctx` commands.
+`ctx turso` reads and writes a shared history store in a remote
+libSQL-compatible database. A direct Turso import of an existing
+`work.sqlite` is recognized as an imported ctx snapshot, so `ctx turso status`
+and `ctx turso search` do not create a local ctx database.
 
 ```bash
 export CTX_TURSO_DATABASE_URL='libsql://your-database.turso.io'
@@ -39,6 +40,11 @@ ctx turso push --batch-size 100
 ctx turso search 'deployment' --provider codex
 ctx turso status
 ```
+
+For a one-time migration of a large existing index, use Turso's SQLite import
+instead of exporting one event at a time. The imported database gets a new
+Turso database name based on the input filename; point
+`CTX_TURSO_DATABASE_URL` at that database afterwards.
 
 - Credentials are read only from `CTX_TURSO_DATABASE_URL` and
   `CTX_TURSO_AUTH_TOKEN`. Do not put an auth token in a command argument, a

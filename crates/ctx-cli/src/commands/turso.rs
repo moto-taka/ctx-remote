@@ -145,6 +145,12 @@ struct TursoPushReport {
     batches: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteLayout {
+    Projection,
+    Snapshot,
+}
+
 pub(crate) fn run_turso(args: TursoArgs, data_root: PathBuf) -> Result<()> {
     match args.command {
         TursoCommand::Init(args) => run_async(init(args.json)),
@@ -324,10 +330,8 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
         scanned += events.len();
         after_id = Some(last.id);
 
-        let transaction = conn
-            .transaction()
-            .await
-            .context("begin Turso upload transaction")?;
+        let mut sql = String::new();
+        let mut exported_statements = 0usize;
         for event in &events {
             if !remote_export_allowed(event, args.include_local_only) {
                 skipped += 1;
@@ -346,45 +350,47 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
                 .map(String::as_str)
                 .unwrap_or("unknown");
             let dedupe_key = remote_dedupe_key(event, &session_identities);
-            let changed = tokio::time::timeout(
+            sql.push_str("INSERT OR IGNORE INTO ctx_turso_events \
+                (event_id, session_id, provider, role, event_type, occurred_at_ms, dedupe_key, payload_json, search_text) VALUES (");
+            sql.push_str(sql_text_literal(event.id.to_string().as_str()).as_str());
+            sql.push(',');
+            push_optional_sql_text_literal(&mut sql, event.session_id.map(|id| id.to_string()));
+            sql.push(',');
+            sql.push_str(sql_text_literal(provider).as_str());
+            sql.push(',');
+            push_optional_sql_text_literal(
+                &mut sql,
+                event.role.map(|role| role.as_str().to_owned()),
+            );
+            sql.push(',');
+            sql.push_str(sql_text_literal(event.event_type.as_str()).as_str());
+            sql.push(',');
+            sql.push_str(event.occurred_at.timestamp_millis().to_string().as_str());
+            sql.push(',');
+            push_optional_sql_text_literal(&mut sql, dedupe_key);
+            sql.push(',');
+            sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
+            sql.push_str(", '');");
+            exported_statements += 1;
+        }
+        if exported_statements > 0 {
+            let before_changes = conn.total_changes();
+            tokio::time::timeout(
                 REMOTE_WRITE_TIMEOUT,
-                transaction.execute(
-                    "INSERT OR IGNORE INTO ctx_turso_events \
-                     (event_id, session_id, provider, role, event_type, occurred_at_ms, dedupe_key, payload_json, search_text) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    libsql::params![
-                        event.id.to_string(),
-                        event.session_id.map(|id| id.to_string()),
-                        provider,
-                        event.role.map(|role| role.as_str().to_owned()),
-                        event.event_type.as_str(),
-                        event.occurred_at.timestamp_millis(),
-                        dedupe_key.as_deref(),
-                        payload_json,
-                        "",
-                    ],
-                ),
+                conn.execute_transactional_batch(sql.as_str()),
             )
             .await
             .with_context(|| {
                 format!(
-                    "upload event {} timed out after {} seconds",
-                    event.id,
+                    "upload batch ending at event {} timed out after {} seconds",
+                    last.id,
                     REMOTE_WRITE_TIMEOUT.as_secs()
                 )
             })?
-            .with_context(|| format!("upload event {}", event.id))?;
-            uploaded += changed;
+            .context("upload Turso event batch")?;
+            let after_changes = conn.total_changes();
+            uploaded += after_changes.saturating_sub(before_changes);
         }
-        tokio::time::timeout(REMOTE_WRITE_TIMEOUT, transaction.commit())
-            .await
-            .with_context(|| {
-                format!(
-                    "commit Turso upload transaction timed out after {} seconds",
-                    REMOTE_WRITE_TIMEOUT.as_secs()
-                )
-            })?
-            .context("commit Turso upload transaction")?;
         batches += 1;
     }
 
@@ -394,6 +400,17 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
         scanned_events: scanned,
         batches,
     })
+}
+
+fn sql_text_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn push_optional_sql_text_literal(target: &mut String, value: Option<String>) {
+    match value {
+        Some(value) => target.push_str(sql_text_literal(value.as_str()).as_str()),
+        None => target.push_str("NULL"),
+    }
 }
 
 fn remote_dedupe_key(
@@ -453,9 +470,9 @@ fn print_push_report(report: &TursoPushReport, json_output: bool) -> Result<()> 
 
 async fn search(args: TursoSearchArgs) -> Result<()> {
     let conn = connect().await?;
-    require_projection(&conn).await?;
-    let (sql, params) = if let Some(provider) = args.provider.as_deref() {
-        (
+    let layout = remote_layout(&conn).await?;
+    let (sql, params) = match (layout, args.provider.as_deref()) {
+        (RemoteLayout::Projection, Some(provider)) => (
             "SELECT event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json \
              FROM ctx_turso_events WHERE provider = ?1 AND payload_json LIKE ?2 ESCAPE '\\' COLLATE NOCASE \
              ORDER BY occurred_at_ms DESC LIMIT ?3",
@@ -464,9 +481,8 @@ async fn search(args: TursoSearchArgs) -> Result<()> {
                 libsql::Value::Text(substring_pattern(&args.query)),
                 libsql::Value::Integer(args.limit as i64),
             ]),
-        )
-    } else {
-        (
+        ),
+        (RemoteLayout::Projection, None) => (
             "SELECT event_id, session_id, provider, role, event_type, occurred_at_ms, payload_json \
              FROM ctx_turso_events WHERE payload_json LIKE ?1 ESCAPE '\\' COLLATE NOCASE \
              ORDER BY occurred_at_ms DESC LIMIT ?2",
@@ -474,7 +490,26 @@ async fn search(args: TursoSearchArgs) -> Result<()> {
                 libsql::Value::Text(substring_pattern(&args.query)),
                 libsql::Value::Integer(args.limit as i64),
             ]),
-        )
+        ),
+        (RemoteLayout::Snapshot, Some(provider)) => (
+            "SELECT ctx_event_id, ctx_session_id, COALESCE(provider, 'unknown'), role, event_type, occurred_at_ms, payload_json \
+             FROM ctx_events WHERE provider = ?1 AND payload_json LIKE ?2 ESCAPE '\\' COLLATE NOCASE \
+             ORDER BY occurred_at_ms DESC LIMIT ?3",
+            libsql::params_from_iter(vec![
+                libsql::Value::Text(provider.to_owned()),
+                libsql::Value::Text(substring_pattern(&args.query)),
+                libsql::Value::Integer(args.limit as i64),
+            ]),
+        ),
+        (RemoteLayout::Snapshot, None) => (
+            "SELECT ctx_event_id, ctx_session_id, COALESCE(provider, 'unknown'), role, event_type, occurred_at_ms, payload_json \
+             FROM ctx_events WHERE payload_json LIKE ?1 ESCAPE '\\' COLLATE NOCASE \
+             ORDER BY occurred_at_ms DESC LIMIT ?2",
+            libsql::params_from_iter(vec![
+                libsql::Value::Text(substring_pattern(&args.query)),
+                libsql::Value::Integer(args.limit as i64),
+            ]),
+        ),
     };
     let mut rows = conn
         .query(sql, params)
@@ -504,7 +539,10 @@ async fn search(args: TursoSearchArgs) -> Result<()> {
 
 async fn status(json_output: bool) -> Result<()> {
     let conn = connect().await?;
-    require_projection(&conn).await?;
+    let layout = remote_layout(&conn).await?;
+    if matches!(layout, RemoteLayout::Snapshot) {
+        return print_snapshot_status(&conn, json_output).await;
+    }
     let mut rows = conn
         .query(
             "SELECT COUNT(*), COUNT(DISTINCT provider), MIN(occurred_at_ms), MAX(occurred_at_ms) \
@@ -575,13 +613,56 @@ fn substring_pattern(query: &str) -> String {
     )
 }
 
-async fn require_projection(conn: &libsql::Connection) -> Result<()> {
-    conn.query("SELECT 1 FROM ctx_turso_events LIMIT 1", ())
+async fn remote_layout(conn: &libsql::Connection) -> Result<RemoteLayout> {
+    if conn
+        .query("SELECT 1 FROM ctx_turso_events LIMIT 1", ())
         .await
-        .context(
-            "open Turso ctx projection; run `ctx turso init` with a write-capable token first",
-        )?;
+        .is_ok()
+    {
+        return Ok(RemoteLayout::Projection);
+    }
+    if conn
+        .query("SELECT 1 FROM ctx_events LIMIT 1", ())
+        .await
+        .is_ok()
+    {
+        return Ok(RemoteLayout::Snapshot);
+    }
+    Err(anyhow!(
+        "remote database is neither a ctx Turso projection nor an imported ctx SQLite snapshot"
+    ))
+}
+
+async fn print_snapshot_status(conn: &libsql::Connection, json_output: bool) -> Result<()> {
+    let schema_version = remote_scalar_i64(conn, "PRAGMA user_version", "schema version").await?;
+    let page_count = remote_scalar_i64(conn, "PRAGMA page_count", "page count").await?;
+    let value = json!({
+        "remote_primary": true,
+        "storage_layout": "imported_sqlite_snapshot",
+        "schema_version": schema_version,
+        "page_count": page_count,
+    });
+    if json_output {
+        print_json(value)?;
+    } else {
+        for (key, value) in value.as_object().expect("status is an object") {
+            println!("{key}: {value}");
+        }
+    }
     Ok(())
+}
+
+async fn remote_scalar_i64(conn: &libsql::Connection, sql: &str, label: &str) -> Result<i64> {
+    let mut rows = conn
+        .query(sql, ())
+        .await
+        .with_context(|| format!("read imported snapshot {label}"))?;
+    rows.next()
+        .await
+        .with_context(|| format!("read imported snapshot {label} row"))?
+        .ok_or_else(|| anyhow!("imported snapshot returned no {label}"))?
+        .get::<i64>(0)
+        .with_context(|| format!("read imported snapshot {label} value"))
 }
 
 fn remote_export_allowed(event: &ctx_history_core::Event, include_local_only: bool) -> bool {
@@ -639,5 +720,10 @@ mod tests {
     #[test]
     fn escapes_like_wildcards_in_queries() {
         assert_eq!(substring_pattern("50%_off\\now"), "%50\\%\\_off\\\\now%");
+    }
+
+    #[test]
+    fn quotes_sql_text_literals_for_transactional_batches() {
+        assert_eq!(sql_text_literal("a'quoted value"), "'a''quoted value'");
     }
 }

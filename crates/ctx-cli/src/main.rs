@@ -77,7 +77,11 @@ const DEFAULT_VISIBLE_SOURCE_PROVIDERS: &[CaptureProvider] = &[
 ];
 
 #[derive(Debug, Parser)]
-#[command(name = "ctx", version, about = "Search local agent history")]
+#[command(
+    name = "ctx",
+    version,
+    about = "Search agent history locally or through Turso"
+)]
 struct Cli {
     #[arg(long, env = "CTX_DATA_ROOT", global = true)]
     data_root: Option<PathBuf>,
@@ -111,7 +115,7 @@ enum CommandRoot {
     Search(SearchArgs),
     #[command(about = "Run read-only SQL against the local ctx index")]
     Sql(SqlArgs),
-    #[command(about = "Sync and search ctx history through a remote libSQL database")]
+    #[command(about = "Use Turso as the remote-primary ctx history store")]
     Turso(commands::turso::TursoArgs),
     #[command(about = "Read embedded ctx documentation")]
     Docs(docs::DocsArgs),
