@@ -27,7 +27,7 @@ const DEFAULT_PUSH_BATCH_SIZE: usize = 100;
 const MAX_PUSH_BATCH_SIZE: usize = 1000;
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 200;
-const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const REMOTE_PROJECTION_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const DEFAULT_REMOTE_SYNC_INTERVAL_SECONDS: u64 = 300;
 const MIN_REMOTE_SYNC_INTERVAL_SECONDS: u64 = 15;
@@ -899,6 +899,7 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
 
         let mut sql = String::new();
         let mut exported_statements = 0usize;
+        let mut projected_event_ids = Vec::new();
         for event in &events {
             if !remote_export_allowed(event, args.include_local_only) {
                 skipped += 1;
@@ -967,21 +968,22 @@ async fn push(store: Store, args: TursoPushArgs) -> Result<TursoPushReport> {
                 sql.push_str(event_id_literal.as_str());
             }
             sql.push_str(";");
-            // FTS5 has no unique event-id constraint. Replace this document in the same remote
-            // transaction so retries remain idempotent and newly imported events are searchable.
-            sql.push_str("DELETE FROM ctx_turso_search WHERE event_id = ");
-            sql.push_str(event_id_literal.as_str());
-            sql.push_str(";");
-            sql.push_str("INSERT INTO ctx_turso_search(event_id, search_text) SELECT ");
-            sql.push_str(event_id_literal.as_str());
-            sql.push(',');
-            sql.push_str(sql_text_literal(payload_json.as_str()).as_str());
-            sql.push_str(" WHERE EXISTS (SELECT 1 FROM ctx_turso_events WHERE event_id = ");
-            sql.push_str(event_id_literal.as_str());
-            sql.push_str(");");
+            projected_event_ids.push(event_id_literal);
             exported_statements += 1;
         }
         if exported_statements > 0 {
+            let event_ids = projected_event_ids.join(",");
+            // FTS5 has no unique event-id constraint. Replace the batch in the same remote
+            // transaction so retries remain idempotent and newly imported events are searchable.
+            sql.push_str("DELETE FROM ctx_turso_search WHERE event_id IN (");
+            sql.push_str(&event_ids);
+            sql.push_str(");");
+            sql.push_str(
+                "INSERT INTO ctx_turso_search(event_id, search_text) \
+                 SELECT event_id, search_text FROM ctx_turso_events WHERE event_id IN (",
+            );
+            sql.push_str(&event_ids);
+            sql.push_str(");");
             tokio::time::timeout(
                 REMOTE_WRITE_TIMEOUT,
                 conn.execute_transactional_batch(sql.as_str()),
