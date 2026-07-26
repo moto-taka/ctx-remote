@@ -1,262 +1,233 @@
-<img src="docs/assets/ctx-readme-banner.png" alt="You have months of coding agent history on your machine. Search it with ctx." width="100%">
+# ctx-remote
 
-ctx is an open-source CLI for fast local search across your past coding agent sessions.
+<img src="docs/assets/ctx-remote-hero.png" alt="ctx-remote connects coding-agent histories from multiple computers to one shared remote database." width="100%">
 
-Coding agents usually start from zero. They can inspect the current repo, but they often cannot recover the discussions, decisions, failed attempts, commands, and test results from earlier work.
+**Remote-first shared coding-agent history. One searchable timeline across every Mac.**
 
-Those sessions are full of useful context:
+ctx-remote collects persisted coding-agent sessions, normalizes them in memory,
+and writes them directly to a shared libSQL database. Turso is the primary
+store: ctx-remote does not create or maintain a local ctx SQLite index.
 
-- decisions, constraints, intent, and rejected approaches from you
-- bug investigations, refactors, file paths, commands, patches, and notes from previous agents
+Use it when you want to:
 
-ctx indexes those logs into SQLite on your machine, then gives current and future agents a CLI for finding the prior discussion, command, or failed attempt before they repeat it.
+- search a conversation from another computer
+- merge agent history from multiple Macs without copying database files
+- keep the normalized ctx index off local disks
+- accumulate new Codex, Claude, OpenCode, and Qwen Code sessions automatically
+- give every coding agent the same evidence-backed history
 
-## This fork: Turso remote-primary
+## What makes it different
 
-This branch adds an optional remote-primary mode for people who want the same
-agent history on multiple computers or do not want a persistent ctx-owned
-SQLite index on each machine.
-
-It is maintained in this fork and has not been proposed to the upstream
-repository.
-
-| Area | Upstream ctx | This fork's remote-primary mode |
+| | Local ctx | ctx-remote |
 | --- | --- | --- |
-| Primary ctx storage | Local `work.sqlite` | Remote libSQL / Turso database |
-| Provider import | Provider history → local ctx index | Provider history → in-memory normalization → remote database |
-| Background updates | Local maintenance daemon | Optional macOS launchd auto-sync |
-| Multiple computers | Separate local indexes | Merge into one database with stable event deduplication |
-| Credentials | Not required for local use | One-day Turso database tokens held in process memory |
-| Local ctx database | Created by normal setup | No persistent ctx `work.sqlite`, WAL, or SHM |
+| Primary index | Local `work.sqlite` | Remote libSQL / Turso |
+| Import path | Provider history → local index | Provider history → memory → remote database |
+| Multiple Macs | Separate indexes | One merged event timeline |
+| Repeated imports | Local refresh | Stable remote deduplication |
+| Background operation | Local maintenance | macOS launchd remote sync |
+| Credentials | None | One-day Turso token, kept in process memory |
+| Local ctx SQLite | Required | Not created |
 
-Provider-owned source files are not deleted or replaced. OpenCode, for example,
-can continue using its own SQLite database; the promise above applies to the
-ctx-owned normalized index.
+Provider-owned histories still belong to their applications and remain where
+those applications store them. For example, OpenCode may continue to use its
+own SQLite database. “No local ctx SQLite” means ctx-remote does not add a
+second persistent normalized index, WAL, or SHM file.
 
-### Automatic Turso accumulation
+## How it works
 
-The included macOS service watches these sources:
+<img src="docs/assets/ctx-remote-architecture.png" alt="Mac 1 and Mac 2 normalize coding-agent histories in memory and merge them into a deduplicated Turso remote-primary database, with no local ctx SQLite." width="100%">
 
-- Codex: `~/.codex/sessions`
-- Claude Code default (`clc`): `~/.claude/projects`
-- Claude Code alternate (`sclc`): `~/.claude-sapeet/projects`
-- OpenCode: `~/.local/share/opencode/opencode.db`
-- Qwen Code: `~/.qwen/projects`
+1. Each Mac reads the provider history already written by its coding agents.
+2. A source is imported after it has been quiet for two minutes.
+3. Events are normalized in a short-lived, in-memory ctx store.
+4. Idempotent batches are written to the shared Turso database.
+5. Stable provider, session, and event identities deduplicate copied or shared
+   histories.
+6. `ctx-remote` searches the same remote projection from either Mac.
 
-The default polling interval is one minute between completed passes. A provider
-is uploaded after its files have been quiet for two minutes, so an actively
-written session is not repeatedly re-imported. Imports are idempotent, and
-matching provider/session/event identities are deduplicated when two Macs
-upload the same history.
+The default service checks once per minute. An active session is left alone
+until the quiet window closes, so a session is not re-imported on every write.
+Replaying an import is safe.
 
-The service uses a logged-in Turso CLI to create a one-day database token. It
-refreshes the token before expiration and keeps it in process memory; the token
-is not written to the repository, launchd plist, or ctx config.
+## Quick start
 
-Build this fork's CLI from the checkout:
+### 1. Build ctx-remote
+
+Requirements:
+
+- Rust 1.88 or newer
+- the [Turso CLI](https://docs.turso.tech/cli/introduction)
+- macOS for the included automatic launchd service
 
 ```bash
+git clone https://github.com/moto-taka/ctx-remote.git
+cd ctx-remote
 cargo install --locked --force --path crates/ctx-cli
 ```
 
-Create or choose a Turso database, log in, and install the service:
+The installed Rust binary remains named `ctx` for compatibility with the
+upstream crate and existing scripts. The installer below adds the public
+remote-first command, `ctx-remote`.
+
+### 2. Create or select a Turso database
 
 ```bash
 turso auth login
 turso db create your-database
 turso db show your-database --url
+```
 
+### 3. Enable automatic remote sync
+
+Run this from the repository checkout:
+
+```bash
 scripts/install-ctx-turso-launchd.sh \
   --database-name your-database \
   --database-url libsql://your-database.turso.io
 ```
 
-The installer resolves the current home directory and the installed `ctx` and
-`turso` binaries on that Mac. The repository does not contain a username or an
-absolute home path. Repeat the installer on another Mac with the same database
-name and URL to share and merge both histories.
+The installer:
 
-The installer also provides `ctx-remote` for interactive commands and agent
-skills. It loads the remote-primary configuration and obtains a short-lived
-token without exposing it:
+- resolves binaries and the current home directory on that Mac
+- installs the sync service and `ctx-remote` runner
+- stores only the database name, database URL, and resolved executable paths
+- obtains one-day database tokens from the logged-in Turso CLI
+- keeps auth tokens in process memory instead of config files or launchd plists
+- enables remote-primary mode without running `ctx setup`
+
+Repeat the same installation on another Mac with the same database name and URL.
+Both machines will merge into the same event timeline.
+
+### 4. Search from anywhere
 
 ```bash
 ctx-remote status
-ctx-remote search 'deployment'
+ctx-remote search 'failed migration'
+ctx-remote search 'deployment' --provider codex
 ctx-remote show session <ctx-session-id>
 ```
 
-When this service is configured, use `ctx-remote` rather than treating an empty
-local `ctx status` as a reason to run `ctx setup`.
+When ctx-remote is configured, an empty local `ctx status` is not a reason to
+initialize local storage. Use `ctx-remote status`.
 
-For a one-off foreground import without launchd:
+## Automatic provider coverage
+
+The included macOS service watches:
+
+| Source | Default location |
+| --- | --- |
+| Codex | `~/.codex/sessions` |
+| Claude Code (`clc`) | `~/.claude/projects` |
+| Claude Code alternate (`sclc`) | `~/.claude-sapeet/projects` |
+| OpenCode | `~/.local/share/opencode/opencode.db` |
+| Qwen Code | `~/.qwen/projects` |
+
+The native foreground importer can also discover and import every provider
+adapter inherited from ctx:
 
 ```bash
 export CTX_TURSO_DATABASE_URL='libsql://your-database.turso.io'
 export CTX_TURSO_AUTH_TOKEN="$(turso db tokens create your-database --expiration 1d)"
 
-ctx turso import
+ctx turso import --batch-size 100
 ctx turso status
-ctx turso search 'deployment'
 
 unset CTX_TURSO_AUTH_TOKEN
 ```
 
-Remote-primary currently targets native provider imports and the portable
-Turso projection/search commands. Local semantic search, read-only SQL, and
-other features that depend on the full local ctx store remain upstream-style
-local features. See [CLI reference](docs/cli-reference.md#remote-primary-libsql--turso)
-and [limitations](docs/limitations.md) for details.
+See the machine-readable [provider support matrix](docs/provider-support-matrix.json)
+and [provider documentation](docs/providers.md) for the complete current list.
 
-## Install and set up ctx
+## Remote-primary commands
 
-> The generic installer below installs an upstream release. Build from this
-> fork as shown above when you need remote-primary or automatic Turso sync.
-
-macOS, Linux, and FreeBSD:
-```bash
-curl -fsSL https://ctx.rs/install | sh
-```
-
-Windows PowerShell:
-```powershell
-irm https://ctx.rs/install.ps1 | iex
-```
-
-or prompt your agent:
-```
-Please install and set up ctx CLI (see github.com/ctxrs/ctx)
-```
-
-## 50x more token-efficient than raw transcript search
-
-By structuring agent history into sessions, events, metadata, and indexed fields, then returning ranked cited matches, agents can access meaningful history with far fewer tokens than raw search. Results vary by query and corpus, but raw search is often so token-heavy that it can be effectively the same as not having usable history.
-
-<img src="docs/assets/ctx-token-efficiency-chart.png" alt="Token output per agent history search: ctx search 917 tokens, raw transcript search 45,734 tokens." width="100%">
-
-## How it works
-
-Your past agent sessions are stored in local provider history files. ctx discovers supported sources, imports the real persisted records, and stores normalized session, event, and touched-file metadata in a local SQLite database optimized for retrieval.
-
-ctx is written in Rust and stores a local SQLite index, so searches are fast, scriptable, and do not require a background service.
-
-The index is local and private by default. Transcript text is preserved rather than hiding local paths or secret-shaped strings, so review copied output before sharing it outside the machine.
+`ctx-remote` loads the installed remote configuration and obtains a short-lived
+token when needed. It is the recommended interactive and agent-facing entry
+point.
 
 ```bash
-# Index all of your existing local agent sessions
-ctx setup
-
-# Your agent can search prior work with normal language
-ctx search "failed migration"
-
-# Search sessions/events that touched a file
-ctx search --file crates/foo/src/lib.rs
-
-# Or search multiple terms
-ctx search --term "failed migration" --term rollback --term "cursor rename"
-
-# Advanced: inspect exact local index data with read-only SQL
-ctx sql "SELECT provider, COUNT(*) AS sessions FROM ctx_sessions GROUP BY provider"
-
-# Results include matching sessions, snippets, and ctx IDs
-# evt_01h...  ses_01h...  codex  "migration expected the old cursor name" ...
-
-# Print the matching part of the old transcript
-ctx show event <ctx-event-id> --window 3
-
-# Or print a compact transcript of the original session
-ctx show session <ctx-session-id>
+ctx-remote status
+ctx-remote import
+ctx-remote search '<query>'
+ctx-remote show event <ctx-event-id> --window 3
+ctx-remote show session <ctx-session-id>
 ```
 
-Those IDs let your current agent recover as much context from previous sessions as it needs.
-
-ctx does not send your prompts, transcripts, or indexed history to a cloud service, call model APIs, require API keys, or write into your source repositories.
-
-The installed binary also includes local docs and man-page generation:
+The underlying explicit command family is also available:
 
 ```bash
-ctx docs search "upgrade"
-ctx docs show cli-reference
-ctx docs man --print ctx
+ctx turso init
+ctx turso import --watch --interval-seconds 60
+ctx turso push --batch-size 100
+ctx turso search '<query>'
+ctx turso status
 ```
 
-Official installer-managed binaries support signed self-upgrades:
+`ctx turso push` is for migrating an existing ctx index. Normal ongoing
+operation uses `ctx turso import`, which reads native provider sources through
+an in-memory store and does not create a persistent ctx database.
+
+## Storage and merge semantics
+
+- Each import is idempotent and may be retried.
+- Imports from multiple Macs are unioned in the remote database.
+- Events with stable provider-owned session identities are deduplicated even
+  when their source paths differ.
+- Histories without a stable provider session ID stay separate rather than
+  risk losing valid independent events.
+- Provider-owned SQLite sources may be copied to an operating-system temporary
+  directory for a consistent read. The copy is removed when the command exits
+  and is not a ctx index.
+- Transcript payloads may contain local paths, commands, prompts, or secrets
+  written by an agent. Protect the Turso database accordingly.
+
+## Current scope
+
+The remote path provides portable event projection, lexical search, status,
+import, and show behavior. Local semantic search, raw SQL, MCP, artifact bodies,
+and features tied to the full local ctx store are not remote-capable yet.
+
+Turso/libSQL is the first supported remote protocol. Other hosted SQLite
+services need a compatible remote libSQL protocol; a database file exposed over
+ordinary network storage is not sufficient.
+
+See [remote-primary CLI reference](docs/cli-reference.md#remote-primary-libsql--turso)
+and [known limitations](docs/limitations.md#remote-projection-semantics).
+
+## Agent Skill
+
+The included `ctx-agent-history-search` skill detects remote-primary
+configuration and uses `ctx-remote`. It does not silently initialize or fall
+back to a local ctx database.
+
+Install the skill directory in any compatible agent skill location, or use the
+copy installed in `~/.agents/skills/ctx-agent-history-search`:
+
+```text
+Use ctx-agent-history-search to find the earlier decision and cite the matching
+session before changing the implementation.
+```
+
+See [agent skill installation](docs/agent-skill-install.md) and
+[agent usage](docs/agent-usage.md).
+
+## Origin and compatibility
+
+ctx-remote is an independently maintained remote-first fork of
+[ctxrs/ctx](https://github.com/ctxrs/ctx). It preserves the internal `ctx`
+binary, event model, provider adapters, and most CLI contracts so existing
+workflows remain usable, while making shared remote storage the primary product
+path.
+
+The upstream project remains the source for local-first behavior and its
+website documentation. This repository has its own installation path,
+remote-primary operating model, release decisions, and README.
+
+## Development
 
 ```bash
-ctx upgrade status
-ctx upgrade check
+cargo test
+./scripts/check-docs.sh
 ```
 
-Source builds and package-manager installs remain unmanaged and do not self-upgrade.
-
-For the full pipeline, see [How ctx works](https://ctx.rs/concepts/how-it-works). For a quick first run, see [Quickstart](https://ctx.rs/first-search).
-
-## Supported agent histories
-
-Support means ctx can discover or read that harness's persisted local history and import it into the local search index. Use `ctx sources --json` on your machine to see which sources are currently `importable`.
-
-| Agent harness | Support |
-| --- | --- |
-| Claude Code | Supported |
-| Codex | Supported |
-| Cursor | Supported |
-| Pi | Supported |
-| GitHub Copilot CLI | Supported |
-| OpenCode | Supported |
-| Gemini CLI / Antigravity | Supported |
-| Factory AI Droid | Supported |
-| OpenClaw | Supported |
-| Hermes Agent | Supported |
-| AstrBot | Supported |
-| NanoClaw | Supported |
-| Shelley | Supported |
-| Auggie / Augment | Supported |
-| Cline / Roo Code | Supported |
-| CodeBuddy | Supported |
-| Continue | Supported |
-| Crush | Supported |
-| Deep Agents | Supported |
-| Firebender | Supported |
-| ForgeCode | Supported |
-| Goose | Supported |
-| Junie | Supported |
-| Kilo Code | Supported |
-| Kimi Code CLI | Supported |
-| Kiro CLI | Supported |
-| Lingma | Supported |
-| MiMo Code | Supported |
-| Mistral Vibe | Supported |
-| Mux | Supported |
-| OpenHands | Supported |
-| Qoder | Supported |
-| Qwen Code | Supported |
-| Rovo Dev | Supported |
-| Tabnine CLI | Supported |
-| Trae / Trae CN | Supported |
-| Warp | Supported |
-| Windsurf | Supported |
-| Zed | Supported |
-
-## How ctx compares
-
-Agent memory tools usually save compact facts, summaries, vectors, or graph nodes. Those can help with stable preferences, but they are weak evidence when the next agent needs to know where a decision came from, what command failed, or what was rejected in the original conversation.
-
-Graphify-style tools answer a different question. They map the current repository: files, symbols, imports, folders, and relationships. ctx searches the prior agent sessions that explain what happened while people and agents changed that repository.
-
-ctx keeps retrieval tied to sessions and events, so another agent can inspect the source before using it. Read more about [agent memory](https://ctx.rs/comparisons/agent-memory), [Graphify-style codebase graphs](https://ctx.rs/comparisons/codebase-graphs), and [grep or log search](https://ctx.rs/comparisons/grep-log-search).
-
-## Explore the docs
-
-| Page | What it covers |
-| --- | --- |
-| [Install](https://ctx.rs/getting-started/install) | Install ctx, initialize local storage, and index discovered local history. |
-| [Quickstart](https://ctx.rs/first-search) | Search local history, inspect an event, open the session, and use JSON output. |
-| [Install the ctx skill](https://ctx.rs/skill) | Install the agent-history search skill with the open skills installer. |
-| [Package managers and unmanaged installs](docs/unmanaged-installs.md) | Install from GitHub Releases, mise, Homebrew, or source builds. |
-| [Agent plugin installs](docs/agent-skill-install.md) | Install the ctx skill through Codex, Claude Code, Cursor, or a raw skill folder. |
-| [SDKs](docs/sdks.md) | Use ctx agent history search from TypeScript, Python, Rust, Go, JVM, Swift, or .NET code. |
-| [Custom history plugins](docs/history-source-plugins.md) | Build an advanced local adapter for agent formats ctx does not support natively. |
-| [Cursor](https://ctx.rs/agents/cursor) | Import Cursor agent transcripts and ask Cursor to cite retrieved local history before editing. |
-| [How it works](https://ctx.rs/concepts/how-it-works) | Understand discovery, import, SQLite storage, search refresh, and cited retrieval. |
-| [Supported agents](https://ctx.rs/concepts/supported-agents) | See which agent histories ctx can discover, import, and search today. |
-| [CLI reference](https://ctx.rs/reference/cli) | Review setup, status, sources, import, show, locate, search, SQL, MCP, and doctor. |
+The project is licensed under the [Apache License 2.0](LICENSE).

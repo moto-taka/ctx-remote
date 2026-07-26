@@ -1,7 +1,7 @@
 [package]
 name = "ctx"
 version = "0.25.0"
-description = "Local CLI for indexing and searching agent session history"
+description = "Remote-first CLI for shared coding-agent history on libSQL"
 edition.workspace = true
 autobins = false
 license.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 categories = ["command-line-utilities", "development-tools"]
-keywords = ["agent", "cli", "search", "sqlite"]
+keywords = ["agent", "cli", "search", "libsql", "remote"]
 
 [[bin]]
 name = "ctx"

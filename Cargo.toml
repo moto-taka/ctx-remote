@@ -13,8 +13,8 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/ctxrs/ctx"
-homepage = "https://github.com/ctxrs/ctx"
+repository = "https://github.com/moto-taka/ctx-remote"
+homepage = "https://github.com/moto-taka/ctx-remote"
 rust-version = "1.88"
 
 [workspace.dependencies]
