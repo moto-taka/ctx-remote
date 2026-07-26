@@ -54,27 +54,27 @@ shipped.
 - The ctx macOS CLI targets macOS 13, but ONNX Runtime 1.27 follows its upstream
   macOS 14 minimum. On macOS 13, daemon-backed lexical search remains available
   while semantic search is unavailable.
-- `ctx turso search` is a remote, ASCII case-insensitive substring search. It does
-  not currently use Turso FTS, semantic retrieval, ctx's local ranking, or
-  artifact bodies; very large remote projections need a dedicated indexed
-  search follow-up before they should replace local lexical-search performance.
+- `ctx turso search` uses the remote FTS5 projection for lexical matching. It
+  does not currently provide semantic retrieval, ctx's local ranking, or
+  artifact bodies. Latency still depends on the remote database size and
+  region.
 
 ## Remote Projection Semantics
 
-- `ctx turso import` uses an in-process-memory ctx store to read all discovered
-  native providers and uploads the resulting event projection without creating
-  a persistent ctx SQLite index. It is memory-bound for large corpora and scans
-  the complete event set on each execution to guarantee that UUID sort order
-  cannot lose newly imported history. It does not yet stream normalized records
-  directly to libSQL or maintain a remote per-source incremental cursor.
-- Remote writes time out after one minute rather than waiting indefinitely. An
-  interrupted upload can be restarted with its last successfully uploaded event
-  UUID through the explicit `--after-event-id` recovery option, provided the
-  local index is unchanged.
-- `ctx turso push` uploads an existing local index. Neither command makes the
-  ordinary local `ctx search`, `show`, SQL, MCP, semantic retrieval, or
-  artifact-body interfaces remote-capable; use `ctx turso search` for remote
-  projection retrieval.
+- `ctx turso import` uses short-lived in-memory ctx stores and uploads the event
+  projection without creating a persistent ctx SQLite index. Remote source
+  fingerprints skip unchanged sources, and Codex/Claude directory imports
+  process changed session files in bounded chunks. A changed provider-owned
+  SQLite source can still require a complete source read.
+- Remote writes time out after twenty minutes rather than waiting indefinitely.
+  An interrupted upload can be restarted from the last successfully uploaded
+  event UUID through the explicit `--after-event-id` recovery option, provided
+  the local index is unchanged.
+- `ctx turso push` uploads an existing local index. With
+  `CTX_TURSO_DATABASE_URL` configured, top-level `status`, `import`, `search`,
+  `show`, and `daemon run` use the remote-primary backend while local index,
+  SQL, and doctor commands are rejected. MCP, semantic retrieval, and
+  artifact-body interfaces are not remote-capable.
 - Event UUID plus provider dedupe keys make repeated pushes and most separately
   captured histories idempotent across Macs. For source-scoped provider keys,
   Turso derives a canonical key from the provider-owned session ID, event index,

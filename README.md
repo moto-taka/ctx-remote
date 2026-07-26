@@ -11,7 +11,94 @@ Those sessions are full of useful context:
 
 ctx indexes those logs into SQLite on your machine, then gives current and future agents a CLI for finding the prior discussion, command, or failed attempt before they repeat it.
 
+## This fork: Turso remote-primary
+
+This branch adds an optional remote-primary mode for people who want the same
+agent history on multiple computers or do not want a persistent ctx-owned
+SQLite index on each machine.
+
+It is maintained in this fork and has not been proposed to the upstream
+repository.
+
+| Area | Upstream ctx | This fork's remote-primary mode |
+| --- | --- | --- |
+| Primary ctx storage | Local `work.sqlite` | Remote libSQL / Turso database |
+| Provider import | Provider history → local ctx index | Provider history → in-memory normalization → remote database |
+| Background updates | Local maintenance daemon | Optional macOS launchd auto-sync |
+| Multiple computers | Separate local indexes | Merge into one database with stable event deduplication |
+| Credentials | Not required for local use | One-day Turso database tokens held in process memory |
+| Local ctx database | Created by normal setup | No persistent ctx `work.sqlite`, WAL, or SHM |
+
+Provider-owned source files are not deleted or replaced. OpenCode, for example,
+can continue using its own SQLite database; the promise above applies to the
+ctx-owned normalized index.
+
+### Automatic Turso accumulation
+
+The included macOS service watches these sources:
+
+- Codex: `~/.codex/sessions`
+- Claude Code default (`clc`): `~/.claude/projects`
+- Claude Code alternate (`sclc`): `~/.claude-sapeet/projects`
+- OpenCode: `~/.local/share/opencode/opencode.db`
+- Qwen Code: `~/.qwen/projects`
+
+The default polling interval is one minute between completed passes. A provider
+is uploaded after its files have been quiet for two minutes, so an actively
+written session is not repeatedly re-imported. Imports are idempotent, and
+matching provider/session/event identities are deduplicated when two Macs
+upload the same history.
+
+The service uses a logged-in Turso CLI to create a one-day database token. It
+refreshes the token before expiration and keeps it in process memory; the token
+is not written to the repository, launchd plist, or ctx config.
+
+Build this fork's CLI from the checkout:
+
+```bash
+cargo install --locked --force --path crates/ctx-cli
+```
+
+Create or choose a Turso database, log in, and install the service:
+
+```bash
+turso auth login
+turso db create your-database
+turso db show your-database --url
+
+scripts/install-ctx-turso-launchd.sh \
+  --database-name your-database \
+  --database-url libsql://your-database.turso.io
+```
+
+The installer resolves the current home directory and the installed `ctx` and
+`turso` binaries on that Mac. The repository does not contain a username or an
+absolute home path. Repeat the installer on another Mac with the same database
+name and URL to share and merge both histories.
+
+For a one-off foreground import without launchd:
+
+```bash
+export CTX_TURSO_DATABASE_URL='libsql://your-database.turso.io'
+export CTX_TURSO_AUTH_TOKEN="$(turso db tokens create your-database --expiration 1d)"
+
+ctx turso import
+ctx turso status
+ctx turso search 'deployment'
+
+unset CTX_TURSO_AUTH_TOKEN
+```
+
+Remote-primary currently targets native provider imports and the portable
+Turso projection/search commands. Local semantic search, read-only SQL, and
+other features that depend on the full local ctx store remain upstream-style
+local features. See [CLI reference](docs/cli-reference.md#remote-primary-libsql--turso)
+and [limitations](docs/limitations.md) for details.
+
 ## Install and set up ctx
+
+> The generic installer below installs an upstream release. Build from this
+> fork as shown above when you need remote-primary or automatic Turso sync.
 
 macOS, Linux, and FreeBSD:
 ```bash
