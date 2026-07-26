@@ -1,6 +1,6 @@
 ---
 name: ctx-agent-history-search
-description: Use ctx to search local coding-agent history before acting. Use when prior agent sessions may contain relevant insights, decisions, attempts, or transcript context.
+description: Use ctx to search local or Turso remote-primary coding-agent history before acting. Use when prior agent sessions may contain relevant insights, decisions, attempts, or transcript context.
 ---
 
 # ctx Agent History Search
@@ -18,19 +18,83 @@ Use this skill in two modes:
 
 ## Prerequisites
 
-- Require the `ctx` CLI to be installed and set up. If it is missing and
-  installing tools is appropriate for the task, install it with:
+- Require the `ctx` CLI. If it is missing and installing tools is appropriate
+  for the task, install it with:
 
   ```bash
   curl -fsSL https://ctx.rs/install | sh
   ```
 
-- First setup can take time while ctx indexes past sessions. If needed, keep it
-  running in the background or in tmux, or wait for it to finish.
-- If ctx remains unavailable, say local history search is unavailable and do not
+- Do not run `ctx setup`, `ctx index`, or `ctx import` merely because local
+  status reports zero events. Those commands create or update a local ctx
+  SQLite index.
+- If ctx remains unavailable, say history search is unavailable and do not
   invent results.
 
-## Workflow
+## Backend Selection
+
+Perform this check before any status, setup, or search command:
+
+```bash
+if [ -n "${CTX_TURSO_DATABASE_URL:-}" ] && [ -n "${CTX_TURSO_AUTH_TOKEN:-}" ]; then
+  echo remote-env
+elif [ -r "${HOME}/.config/ctx/turso-auto-sync.env" ]; then
+  echo remote-service
+elif [ -n "${CTX_TURSO_DATABASE_URL:-}" ]; then
+  echo remote-env-incomplete
+else
+  echo local
+fi
+```
+
+Treat either remote result as authoritative:
+
+- `remote-env`: use `ctx`; its top-level `status`, `search`, and `show`
+  commands route to remote-primary.
+- `remote-service`: use `ctx-remote`, installed by the fork's Turso service.
+  It reads only the machine-local non-secret database configuration, creates a
+  one-day token without printing it, and runs ctx in remote-primary mode.
+- `remote-env-incomplete`: report the missing remote credential. Do not run a
+  local command or initialize a local index.
+- If the remote-service marker exists but `ctx-remote` is missing or fails,
+  report the remote helper problem. Never fall back to local initialization.
+- Never interpret local `0 events`, `missing work.sqlite`, or `uninitialized`
+  as missing history when a remote marker exists.
+- In remote mode, never run `ctx setup`, `ctx index`, `ctx import`, `ctx sql`,
+  `ctx doctor`, `ctx locate`, or `ctx mcp` unless the user explicitly requests
+  a local store or a remote import operation.
+
+Only use the local workflow when neither remote marker exists. If the local
+index is uninitialized, report that fact and initialize it only when the user
+explicitly asks for local indexing.
+
+## Remote-primary Workflow
+
+Use `ctx-remote` below for a remote-service installation. Substitute `ctx` when
+the remote environment variables are already present.
+
+```bash
+ctx-remote status
+ctx-remote sources
+ctx-remote search "<query>"
+ctx-remote search "<query>" --provider codex
+ctx-remote search "<query>" --term "<related term>"
+ctx-remote search "<query>" --session <ctx-session-id>
+ctx-remote show event <ctx-event-id> --window 5
+ctx-remote show session <ctx-session-id>
+```
+
+When given an ID directly, try remote `show session` and `show event` before
+searching for the literal ID with `ctx-remote search "<id>"`. Provider-native
+IDs may be searchable even when they are not ctx session IDs. A failed remote
+lookup does not authorize creating a local index.
+
+Remote-primary search currently supports query text, `--term`, `--provider`,
+`--session`, and `--event-type`. Do not use local-only filters such as
+`--workspace`, `--file`, `--since`, `--include-subagents`, semantic backends,
+or `--include-current-session`.
+
+## Local Workflow
 
 1. Confirm ctx is ready when starting from a cold context:
 
@@ -111,6 +175,9 @@ Use this skill in two modes:
 
 ## When Search Is Not Enough
 
+This section is local-only. In remote-primary mode, report that SQL is
+unavailable instead of creating a local index.
+
 Use `ctx sql` only when normal search cannot express the question, such as
 counts, joins, audits, or scripts over stable local views. Do not use SQL for
 broad transcript text search; `ctx search` is built for that.
@@ -136,8 +203,8 @@ import, initialize, or migrate ctx storage.
 ## History Research Reports
 
 When asked to research a historical topic, stay read-only unless the user also
-asks for edits. The agent writes the report; ctx only retrieves local source
-material.
+asks for edits. The agent writes the report; ctx only retrieves material from
+the selected history backend.
 
 1. Restate the topic, scope, and desired length if the prompt is ambiguous.
    Prefer concise reports by default; use a longer report when the user asks for
@@ -147,6 +214,7 @@ material.
    with `ctx search "<topic>"`, then broaden with `--term` or narrow with
    `--workspace`, `--provider`, `--file`, `--since`, or
    `--session <ctx-session-id>`.
+   In remote-primary mode, use `ctx-remote` and only its supported filters.
    Use `--include-subagents` when reviews, implementation attempts, test output,
    or failure traces are likely to live in delegated sessions. Add
    `--refresh off` when the report must not update the local ctx index.

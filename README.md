@@ -76,6 +76,19 @@ The installer resolves the current home directory and the installed `ctx` and
 absolute home path. Repeat the installer on another Mac with the same database
 name and URL to share and merge both histories.
 
+The installer also provides `ctx-remote` for interactive commands and agent
+skills. It loads the remote-primary configuration and obtains a short-lived
+token without exposing it:
+
+```bash
+ctx-remote status
+ctx-remote search 'deployment'
+ctx-remote show session <ctx-session-id>
+```
+
+When this service is configured, use `ctx-remote` rather than treating an empty
+local `ctx status` as a reason to run `ctx setup`.
+
 For a one-off foreground import without launchd:
 
 ```bash

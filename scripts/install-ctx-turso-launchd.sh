@@ -50,22 +50,30 @@ ctx_bin="$(command -v ctx)"
 turso_bin="$(command -v turso)"
 script_dir="${0:A:h}"
 source_script="${script_dir}/ctx-turso-auto-sync.sh"
+remote_source_script="${script_dir}/ctx-remote.sh"
 [[ -x "${source_script}" ]] || {
   print -u2 "missing executable sync script: ${source_script}"
+  exit 1
+}
+[[ -x "${remote_source_script}" ]] || {
+  print -u2 "missing executable remote CLI script: ${remote_source_script}"
   exit 1
 }
 
 readonly service_label="io.ctx.remote-primary-sync"
 readonly install_dir="${HOME}/.local/libexec/ctx"
+readonly user_bin_dir="${HOME}/.local/bin"
 readonly config_dir="${HOME}/.config/ctx"
 readonly launch_agents_dir="${HOME}/Library/LaunchAgents"
 readonly installed_script="${install_dir}/ctx-turso-auto-sync"
+readonly installed_remote_script="${user_bin_dir}/ctx-remote"
 readonly config_file="${config_dir}/turso-auto-sync.env"
 readonly plist_file="${launch_agents_dir}/${service_label}.plist"
 readonly launch_domain="gui/$(id -u)"
 
-install -d -m 755 "${install_dir}" "${config_dir}" "${launch_agents_dir}"
+install -d -m 755 "${install_dir}" "${user_bin_dir}" "${config_dir}" "${launch_agents_dir}"
 install -m 755 "${source_script}" "${installed_script}"
+install -m 755 "${remote_source_script}" "${installed_remote_script}"
 
 umask 077
 {
@@ -109,5 +117,6 @@ launchctl bootstrap "${launch_domain}" "${plist_file}"
 launchctl enable "${launch_domain}/${service_label}"
 
 print "enabled ${service_label}"
+print "remote CLI: ${installed_remote_script}"
 print "credentials: short-lived token generated in memory from the logged-in Turso CLI"
 print "local ctx SQLite: disabled by remote-primary mode"

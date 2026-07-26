@@ -60,6 +60,16 @@ the repository contains no username, absolute home path, or auth token. Repeat
 the installation on another Mac to merge both machines into the same
 remote-primary database.
 
+The installer also places `ctx-remote` on the user path. Use it for interactive
+and agent-driven status, search, and show commands without creating a local ctx
+index:
+
+```bash
+ctx-remote status
+ctx-remote search 'deployment'
+ctx-remote show session <ctx-session-id>
+```
+
 For a one-time migration of a large existing index, use Turso's SQLite import
 instead of exporting one event at a time. The imported database gets a new
 Turso database name based on the input filename; point
