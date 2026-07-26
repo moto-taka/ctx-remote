@@ -35,11 +35,30 @@ ctx turso init
 # Import every discovered native provider without creating ctx/work.sqlite.
 ctx turso import --batch-size 100
 
+# Keep importing changed provider histories in the foreground.
+ctx turso import --watch --interval-seconds 60
+
 # Or migrate an existing local ctx index.
 ctx turso push --batch-size 100
 ctx turso search 'deployment' --provider codex
 ctx turso status
 ```
+
+On macOS, fork builds include an optional launchd installer:
+
+```bash
+turso auth login
+scripts/install-ctx-turso-launchd.sh \
+  --database-name your-database \
+  --database-url libsql://your-database.turso.io
+```
+
+The service waits until provider files have been quiet for two minutes, imports
+their changes, and rotates one-day Turso database tokens in memory. The
+installer resolves `ctx`, `turso`, and the user's home directory when it runs;
+the repository contains no username, absolute home path, or auth token. Repeat
+the installation on another Mac to merge both machines into the same
+remote-primary database.
 
 For a one-time migration of a large existing index, use Turso's SQLite import
 instead of exporting one event at a time. The imported database gets a new
