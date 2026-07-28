@@ -53,8 +53,11 @@ scripts/install-ctx-turso-launchd.sh \
   --database-url libsql://your-database.turso.io
 ```
 
-The service waits until provider files have been quiet for two minutes, imports
-their changes, and rotates one-day Turso database tokens in memory. The
+The service normally waits until provider files have been quiet for two
+minutes, but forces an idempotent import after a ten-minute maximum defer
+window so continuous agent activity cannot starve the provider. It rotates
+one-day Turso database tokens in memory and uses the macOS system CA bundle at
+`/etc/ssl/cert.pem` instead of requiring launchd keychain access. The
 installer resolves `ctx`, `turso`, and the user's home directory when it runs;
 the repository contains no username, absolute home path, or auth token. Repeat
 the installation on another Mac to merge both machines into the same
@@ -65,6 +68,7 @@ and agent-driven status, search, and show commands without creating a local ctx
 index:
 
 ```bash
+ctx-remote sync-status
 ctx-remote status
 ctx-remote search 'deployment'
 ctx-remote show session <ctx-session-id>

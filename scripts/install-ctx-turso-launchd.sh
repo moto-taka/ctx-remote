@@ -118,5 +118,6 @@ launchctl enable "${launch_domain}/${service_label}"
 
 print "enabled ${service_label}"
 print "remote CLI: ${installed_remote_script}"
+print "sync status: ctx-remote sync-status"
 print "credentials: short-lived token generated in memory from the logged-in Turso CLI"
 print "local ctx SQLite: disabled by remote-primary mode"

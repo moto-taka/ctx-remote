@@ -38,16 +38,21 @@ second persistent normalized index, WAL, or SHM file.
 <img src="docs/assets/ctx-remote-architecture.png" alt="Mac 1 and Mac 2 normalize coding-agent histories in memory and merge them into a deduplicated Turso remote-primary database, with no local ctx SQLite." width="100%">
 
 1. Each Mac reads the provider history already written by its coding agents.
-2. A source is imported after it has been quiet for two minutes.
+2. A source is imported after it has been quiet for two minutes, or after a
+   ten-minute maximum defer window if agents keep writing continuously.
 3. Events are normalized in a short-lived, in-memory ctx store.
 4. Idempotent batches are written to the shared Turso database.
 5. Stable provider, session, and event identities deduplicate copied or shared
    histories.
 6. `ctx-remote` searches the same remote projection from either Mac.
 
-The default service checks once per minute. An active session is left alone
-until the quiet window closes, so a session is not re-imported on every write.
-Replaying an import is safe.
+The default service checks once per minute. An active source normally waits for
+the quiet window, so it is not re-imported on every write. Continuous activity
+cannot starve the provider: after ten minutes the service performs an
+idempotent import even if another session is still being written.
+
+On macOS the service uses `/etc/ssl/cert.pem` explicitly, avoiding launchd
+keychain-access failures while establishing the Turso TLS connection.
 
 ## Quick start
 
@@ -102,6 +107,7 @@ Both machines will merge into the same event timeline.
 ### 4. Search from anywhere
 
 ```bash
+ctx-remote sync-status
 ctx-remote status
 ctx-remote search 'failed migration'
 ctx-remote search 'deployment' --provider codex
@@ -146,6 +152,7 @@ token when needed. It is the recommended interactive and agent-facing entry
 point.
 
 ```bash
+ctx-remote sync-status
 ctx-remote status
 ctx-remote import
 ctx-remote search '<query>'
@@ -165,7 +172,8 @@ ctx turso status
 
 `ctx turso push` is for migrating an existing ctx index. Normal ongoing
 operation uses `ctx turso import`, which reads native provider sources through
-an in-memory store and does not create a persistent ctx database.
+an in-memory store and does not create a persistent ctx database. Therefore,
+`ctx-remote turso push` is not the command for routine automatic sync.
 
 ## Storage and merge semantics
 

@@ -28,6 +28,34 @@ fi
 CTX_BIN="${CTX_BIN:-$(command -v ctx)}"
 export CTX_TURSO_DATABASE_URL
 
+if [[ "${1:-}" == "sync-status" ]]; then
+  readonly STATUS_FILE="${CTX_TURSO_STATUS_FILE:-${HOME}/.local/state/ctx-remote/sync-status.env}"
+  service_state="stopped"
+  if launchctl print "gui/$(id -u)/io.ctx.remote-primary-sync" >/dev/null 2>&1; then
+    service_state="running"
+  fi
+  print -r -- "service=${service_state}"
+  if [[ ! -r "${STATUS_FILE}" ]]; then
+    print -r -- "last_result=never"
+    exit 1
+  fi
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      last_cycle_epoch | last_result | failures | sources_synced | uploaded_events | scanned_events | last_error)
+        print -r -- "${key}=${value}"
+        ;;
+    esac
+  done <"${STATUS_FILE}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "turso" && "${2:-}" == "push" && ! -f "${HOME}/.ctx/work.sqlite" ]]; then
+  print -u2 "ctx-remote turso push migrates an existing local ctx work.sqlite."
+  print -u2 "No local ctx index exists, which is expected in remote-primary mode."
+  print -u2 "Automatic sync uses 'ctx turso import'; check it with 'ctx-remote sync-status'."
+  exit 2
+fi
+
 if [[ -z "${CTX_TURSO_AUTH_TOKEN:-}" ]]; then
   : "${CTX_TURSO_DATABASE_NAME:?database name is required to issue a short-lived token}"
   TURSO_BIN="${TURSO_BIN:-$(command -v turso)}"

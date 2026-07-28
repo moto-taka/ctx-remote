@@ -21,12 +21,23 @@ CTX_BIN="${CTX_BIN:-$(command -v ctx)}"
 TURSO_BIN="${TURSO_BIN:-$(command -v turso)}"
 SYNC_INTERVAL_SECONDS="${CTX_TURSO_SYNC_INTERVAL_SECONDS:-60}"
 QUIET_WINDOW_MINUTES="${CTX_TURSO_QUIET_WINDOW_MINUTES:-2}"
+MAX_DEFER_SECONDS="${CTX_TURSO_MAX_DEFER_SECONDS:-600}"
 TOKEN_REFRESH_SECONDS="${CTX_TURSO_TOKEN_REFRESH_SECONDS:-72000}"
-BATCH_SIZE="${CTX_TURSO_BATCH_SIZE:-100}"
+BATCH_SIZE="${CTX_TURSO_BATCH_SIZE:-250}"
+STATE_DIR="${CTX_TURSO_STATE_DIR:-${HOME}/.local/state/ctx-remote}"
+STATUS_FILE="${CTX_TURSO_STATUS_FILE:-${STATE_DIR}/sync-status.env}"
 
 export CTX_TURSO_DATABASE_URL
+if [[ -z "${SSL_CERT_FILE:-}" && -r /etc/ssl/cert.pem ]]; then
+  export SSL_CERT_FILE=/etc/ssl/cert.pem
+fi
 
 token_issued_at=0
+typeset -A last_sync_epoch
+cycle_sources_synced=0
+cycle_uploaded_events=0
+cycle_scanned_events=0
+cycle_last_error=""
 
 refresh_token() {
   local now token
@@ -58,31 +69,100 @@ source_is_quiet() {
   (( now - modified_at >= QUIET_WINDOW_MINUTES * 60 ))
 }
 
+source_is_ready() {
+  local label="$1"
+  local source_path="$2"
+  local now last_sync
+
+  source_is_quiet "${source_path}" && return 0
+  now="$(date +%s)"
+  last_sync="${last_sync_epoch[${label}]:-0}"
+  (( last_sync == 0 || now - last_sync >= MAX_DEFER_SECONDS ))
+}
+
+json_metric() {
+  local report="$1"
+  local key="$2"
+  local pattern="\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+)"
+  if [[ "${report}" =~ ${pattern} ]]; then
+    print -r -- "${match[1]}"
+  else
+    print -r -- "0"
+  fi
+}
+
+write_status() {
+  local result="$1"
+  local failures="$2"
+  local now temp_file
+
+  now="$(date +%s)"
+  temp_file="${STATUS_FILE}.tmp.$$"
+  umask 077
+  mkdir -p "${STATE_DIR}" || return 1
+  {
+    print -r -- "last_cycle_epoch=${now}"
+    print -r -- "last_result=${result}"
+    print -r -- "failures=${failures}"
+    print -r -- "sources_synced=${cycle_sources_synced}"
+    print -r -- "uploaded_events=${cycle_uploaded_events}"
+    print -r -- "scanned_events=${cycle_scanned_events}"
+    [[ -z "${cycle_last_error}" ]] || print -r -- "last_error=${cycle_last_error}"
+  } >"${temp_file}" || return 1
+  chmod 600 "${temp_file}" || return 1
+  mv -f "${temp_file}" "${STATUS_FILE}"
+}
+
 sync_source() {
   local label="$1"
   local provider="$2"
   local source_path="$3"
+  local report uploaded scanned error_file error_summary
 
   [[ -e "${source_path}" ]] || return 0
-  source_is_quiet "${source_path}" || return 0
-  if ! "${CTX_BIN}" --quiet turso import \
+  source_is_ready "${label}" "${source_path}" || return 0
+  mkdir -p "${STATE_DIR}" || return 1
+  error_file="${STATE_DIR}/sync-error.tmp.$$"
+  if ! report="$("${CTX_BIN}" --quiet turso import \
     --provider "${provider}" \
     --path "${source_path}" \
     --batch-size "${BATCH_SIZE}" \
-    --json >/dev/null 2>&1; then
+    --json 2>"${error_file}")"; then
+    error_summary="$(<"${error_file}")"
+    error_summary="${error_summary//$'\n'/ }"
+    error_summary="${error_summary//=/:}"
+    cycle_last_error="${label}: ${error_summary[1,500]}"
+    rm -f "${error_file}"
     logger -t ctx-turso-sync -- "${label} sync failed; retrying next cycle"
     return 1
   fi
+  rm -f "${error_file}"
+  uploaded="$(json_metric "${report}" "uploaded_events")"
+  scanned="$(json_metric "${report}" "scanned_events")"
+  (( cycle_sources_synced += 1 ))
+  (( cycle_uploaded_events += uploaded ))
+  (( cycle_scanned_events += scanned ))
+  last_sync_epoch[${label}]="$(date +%s)"
+  write_status "running" 0 ||
+    logger -t ctx-turso-sync -- "could not update sync status"
 }
 
 while true; do
+  cycle_sources_synced=0
+  cycle_uploaded_events=0
+  cycle_scanned_events=0
+  cycle_last_error=""
   if ! refresh_token; then
     logger -t ctx-turso-sync -- "could not issue a short-lived Turso token; retrying"
+    write_status "error" 1 ||
+      logger -t ctx-turso-sync -- "could not update sync status"
     sleep "${SYNC_INTERVAL_SECONDS}"
     continue
   fi
 
   failures=0
+  write_status "running" 0 ||
+    logger -t ctx-turso-sync -- "could not update sync status"
   sync_source "Codex" "codex" "${HOME}/.codex/sessions" || (( failures += 1 ))
   sync_source "Claude" "claude" "${HOME}/.claude/projects" || (( failures += 1 ))
   sync_source "Claude alternate" "claude" "${HOME}/.claude-sapeet/projects" ||
@@ -93,6 +173,13 @@ while true; do
 
   if (( failures > 0 )); then
     logger -t ctx-turso-sync -- "${failures} provider sync(s) failed"
+  fi
+  if (( failures == 0 )); then
+    write_status "ok" 0 ||
+      logger -t ctx-turso-sync -- "could not update sync status"
+  else
+    write_status "error" "${failures}" ||
+      logger -t ctx-turso-sync -- "could not update sync status"
   fi
   if [[ "${CTX_TURSO_SYNC_ONCE:-0}" == "1" ]]; then
     exit "${failures}"
