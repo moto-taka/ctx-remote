@@ -19,6 +19,9 @@ if [[ -r "${CONFIG_FILE}" ]]; then
       TURSO_BIN)
         TURSO_BIN="${TURSO_BIN:-${value}}"
         ;;
+      CTX_TURSO_HOOK_SYNC_BIN)
+        CTX_TURSO_HOOK_SYNC_BIN="${CTX_TURSO_HOOK_SYNC_BIN:-${value}}"
+        ;;
     esac
   done <"${CONFIG_FILE}"
 fi
@@ -27,6 +30,24 @@ fi
 
 CTX_BIN="${CTX_BIN:-$(command -v ctx)}"
 export CTX_TURSO_DATABASE_URL
+
+if [[ "${1:-}" == "hook-sync" ]]; then
+  [[ $# == 2 ]] || {
+    print -u2 "usage: ctx-remote hook-sync claude|codex|qwen-code"
+    exit 2
+  }
+  CTX_TURSO_HOOK_SYNC_BIN="${CTX_TURSO_HOOK_SYNC_BIN:-${HOME}/.local/libexec/ctx/ctx-remote-hook-sync}"
+  exec "${CTX_TURSO_HOOK_SYNC_BIN}" request "$2"
+fi
+
+if [[ "${1:-}" == "hook-status" ]]; then
+  readonly HOOK_STATUS_FILE="${CTX_TURSO_STATE_DIR:-${HOME}/.local/state/ctx-remote}/hook-sync-status.json"
+  [[ -r "${HOOK_STATUS_FILE}" ]] || {
+    print -r -- '{"result":"never"}'
+    exit 1
+  }
+  exec /bin/cat "${HOOK_STATUS_FILE}"
+fi
 
 if [[ "${1:-}" == "sync-status" ]]; then
   readonly STATUS_FILE="${CTX_TURSO_STATUS_FILE:-${HOME}/.local/state/ctx-remote/sync-status.env}"

@@ -100,9 +100,35 @@ The installer:
 - obtains one-day database tokens from the logged-in Turso CLI
 - keeps auth tokens in process memory instead of config files or launchd plists
 - enables remote-primary mode without running `ctx setup`
+- installs coalesced session-end sync hooks for Claude, Codex, and Qwen Code
+- loads shared Hindsight memory into new Qwen Code sessions when Hindsight is installed
 
 Repeat the same installation on another Mac with the same database name and URL.
 Both machines will merge into the same event timeline.
+
+### Lifecycle hooks
+
+Agent shutdowns request an immediate `ctx-remote import`. A shared non-blocking
+lock and short debounce merge simultaneous Claude, Codex, and Qwen
+Code exits into one import. The worker runs detached from the agent, retries at
+most three times, and records private status under
+`~/.local/state/ctx-remote/hook-sync-status.json`. It never creates a local ctx
+SQLite database.
+
+```bash
+ctx-remote hook-status
+ctx-remote hook-sync codex
+```
+
+Claude and Qwen Code use their native `SessionEnd` events. Codex reuses the
+already trusted Hindsight `Stop` script instead of rewriting protected hook
+commands.
+
+If the local Hindsight Codex integration is present, the installer also adds:
+
+- a Qwen Code `SessionStart` hook whose `additionalContext` contains recalled memory
+
+Existing agent hooks are preserved. Re-running the installer is idempotent.
 
 ### 4. Search from anywhere
 

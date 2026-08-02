@@ -51,12 +51,27 @@ turso_bin="$(command -v turso)"
 script_dir="${0:A:h}"
 source_script="${script_dir}/ctx-turso-auto-sync.sh"
 remote_source_script="${script_dir}/ctx-remote.sh"
+hook_sync_source_script="${script_dir}/ctx-remote-hook-sync.py"
+hindsight_source_script="${script_dir}/hindsight-session-context.py"
+agent_hooks_installer="${script_dir}/install-agent-lifecycle-hooks.py"
 [[ -x "${source_script}" ]] || {
   print -u2 "missing executable sync script: ${source_script}"
   exit 1
 }
 [[ -x "${remote_source_script}" ]] || {
   print -u2 "missing executable remote CLI script: ${remote_source_script}"
+  exit 1
+}
+[[ -x "${hook_sync_source_script}" ]] || {
+  print -u2 "missing executable hook sync script: ${hook_sync_source_script}"
+  exit 1
+}
+[[ -x "${hindsight_source_script}" ]] || {
+  print -u2 "missing executable Hindsight context script: ${hindsight_source_script}"
+  exit 1
+}
+[[ -x "${agent_hooks_installer}" ]] || {
+  print -u2 "missing agent lifecycle hook installer: ${agent_hooks_installer}"
   exit 1
 }
 
@@ -67,6 +82,8 @@ readonly config_dir="${HOME}/.config/ctx"
 readonly launch_agents_dir="${HOME}/Library/LaunchAgents"
 readonly installed_script="${install_dir}/ctx-turso-auto-sync"
 readonly installed_remote_script="${user_bin_dir}/ctx-remote"
+readonly installed_hook_sync_script="${install_dir}/ctx-remote-hook-sync"
+readonly installed_hindsight_script="${install_dir}/hindsight-session-context"
 readonly config_file="${config_dir}/turso-auto-sync.env"
 readonly plist_file="${launch_agents_dir}/${service_label}.plist"
 readonly launch_domain="gui/$(id -u)"
@@ -74,6 +91,8 @@ readonly launch_domain="gui/$(id -u)"
 install -d -m 755 "${install_dir}" "${user_bin_dir}" "${config_dir}" "${launch_agents_dir}"
 install -m 755 "${source_script}" "${installed_script}"
 install -m 755 "${remote_source_script}" "${installed_remote_script}"
+install -m 755 "${hook_sync_source_script}" "${installed_hook_sync_script}"
+install -m 755 "${hindsight_source_script}" "${installed_hindsight_script}"
 
 umask 077
 {
@@ -81,6 +100,7 @@ umask 077
   print -r -- "CTX_TURSO_DATABASE_URL=${database_url}"
   print -r -- "CTX_BIN=${ctx_bin}"
   print -r -- "TURSO_BIN=${turso_bin}"
+  print -r -- "CTX_TURSO_HOOK_SYNC_BIN=${installed_hook_sync_script}"
 } >"${config_file}"
 
 {
@@ -115,6 +135,7 @@ plutil -lint "${plist_file}" >/dev/null
 launchctl bootout "${launch_domain}/${service_label}" >/dev/null 2>&1 || true
 launchctl bootstrap "${launch_domain}" "${plist_file}"
 launchctl enable "${launch_domain}/${service_label}"
+"${agent_hooks_installer}"
 
 print "enabled ${service_label}"
 print "remote CLI: ${installed_remote_script}"

@@ -10,6 +10,7 @@ if [[ -r "${CONFIG_FILE}" ]]; then
       CTX_TURSO_DATABASE_URL) CTX_TURSO_DATABASE_URL="${value}" ;;
       CTX_BIN) CTX_BIN="${value}" ;;
       TURSO_BIN) TURSO_BIN="${value}" ;;
+      CTX_TURSO_HOOK_SYNC_BIN) CTX_TURSO_HOOK_SYNC_BIN="${value}" ;;
     esac
   done <"${CONFIG_FILE}"
 fi
@@ -26,6 +27,7 @@ TOKEN_REFRESH_SECONDS="${CTX_TURSO_TOKEN_REFRESH_SECONDS:-72000}"
 BATCH_SIZE="${CTX_TURSO_BATCH_SIZE:-250}"
 STATE_DIR="${CTX_TURSO_STATE_DIR:-${HOME}/.local/state/ctx-remote}"
 STATUS_FILE="${CTX_TURSO_STATUS_FILE:-${STATE_DIR}/sync-status.env}"
+CTX_TURSO_HOOK_SYNC_BIN="${CTX_TURSO_HOOK_SYNC_BIN:-${HOME}/.local/libexec/ctx/ctx-remote-hook-sync}"
 
 export CTX_TURSO_DATABASE_URL
 if [[ -z "${SSL_CERT_FILE:-}" && -r /etc/ssl/cert.pem ]]; then
@@ -117,17 +119,23 @@ sync_source() {
   local label="$1"
   local provider="$2"
   local source_path="$3"
-  local report uploaded scanned error_file error_summary
+  local report uploaded scanned error_file error_summary command_status
 
   [[ -e "${source_path}" ]] || return 0
   source_is_ready "${label}" "${source_path}" || return 0
   mkdir -p "${STATE_DIR}" || return 1
   error_file="${STATE_DIR}/sync-error.tmp.$$"
-  if ! report="$("${CTX_BIN}" --quiet turso import \
+  report="$("${CTX_TURSO_HOOK_SYNC_BIN}" locked-exec "${CTX_BIN}" --quiet turso import \
     --provider "${provider}" \
     --path "${source_path}" \
     --batch-size "${BATCH_SIZE}" \
-    --json 2>"${error_file}")"; then
+    --json 2>"${error_file}")"
+  command_status=$?
+  if (( command_status == 75 )); then
+    rm -f "${error_file}"
+    return 0
+  fi
+  if (( command_status != 0 )); then
     error_summary="$(<"${error_file}")"
     error_summary="${error_summary//$'\n'/ }"
     error_summary="${error_summary//=/:}"
