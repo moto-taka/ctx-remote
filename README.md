@@ -108,9 +108,10 @@ Both machines will merge into the same event timeline.
 
 ### Lifecycle hooks
 
-Agent shutdowns request an immediate `ctx-remote import`. A shared non-blocking
+Agent shutdowns request an immediate provider-specific `ctx turso import`. A shared non-blocking
 lock and short debounce merge simultaneous Claude, Codex, and Qwen
-Code exits into one import. The worker runs detached from the agent, retries at
+Code exits into one sequential worker. Duplicate requests for the same provider
+are imported once. The worker runs detached from the agent, retries at
 most three times, and records private status under
 `~/.local/state/ctx-remote/hook-sync-status.json`. It never creates a local ctx
 SQLite database.

@@ -45,16 +45,20 @@ def main() -> int:
                 "CTX_REMOTE_HOOK_TIMEOUT_SECONDS": "5",
             }
         )
+        for relative in (
+            ".claude/projects",
+            ".claude-sapeet/projects",
+            ".codex/sessions",
+            ".qwen/projects",
+        ):
+            (root / relative).mkdir(parents=True)
+        env["HOME"] = str(root)
         processes = [
             subprocess.Popen([sys.executable, str(RUNNER), "request", source], env=env)
-            for source in ("claude", "codex", "qwen-code")
+            for source in ("claude", "codex", "codex", "qwen-code")
         ]
         assert all(process.wait(timeout=3) == 0 for process in processes)
         wait_until(lambda: (state / "hook-sync-status.json").exists())
-        wait_until(lambda: not (state / "hook-sync.pending").exists())
-        time.sleep(0.2)
-        lines = calls.read_text(encoding="utf-8").splitlines()
-        assert lines == ["import --batch-size 250"], lines
 
         def lock_is_clear() -> bool:
             probe = subprocess.run(
@@ -63,6 +67,11 @@ def main() -> int:
             return probe.returncode == 0
 
         wait_until(lock_is_clear)
+        lines = calls.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 4, lines
+        assert sum("--provider codex" in line for line in lines) == 1, lines
+        assert sum("--provider claude" in line for line in lines) == 2, lines
+        assert sum("--provider qwen-code" in line for line in lines) == 1, lines
         holder = subprocess.Popen(
             [sys.executable, str(RUNNER), "locked-exec", "sleep", "1"], env=env
         )
