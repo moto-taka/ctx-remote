@@ -25,7 +25,7 @@ Use it when you want to:
 | Multiple Macs | Separate indexes | One merged event timeline |
 | Repeated imports | Local refresh | Stable remote deduplication |
 | Background operation | Local maintenance | macOS launchd remote sync |
-| Credentials | None | One-day Turso token, kept in process memory |
+| Credentials | None | `CTX_TURSO_AUTH_TOKEN` database token |
 | Local ctx SQLite | Required | Not created |
 
 Provider-owned histories still belong to their applications and remain where
@@ -87,6 +87,8 @@ turso db show your-database --url
 Run this from the repository checkout:
 
 ```bash
+export CTX_TURSO_AUTH_TOKEN="$(turso db tokens create your-database --expiration never)"
+
 scripts/install-ctx-turso-launchd.sh \
   --database-name your-database \
   --database-url libsql://your-database.turso.io
@@ -96,9 +98,10 @@ The installer:
 
 - resolves binaries and the current home directory on that Mac
 - installs the sync service and `ctx-remote` runner
-- stores only the database name, database URL, and resolved executable paths
-- obtains one-day database tokens from the logged-in Turso CLI
-- keeps auth tokens in process memory instead of config files or launchd plists
+- stores the database name, database URL, and resolved executable paths
+- persists `CTX_TURSO_AUTH_TOKEN` in the mode-600 sync environment file when supplied
+- uses the configured database token directly without recurring Turso CLI login
+- falls back to one-day tokens from the Turso CLI only when no database token is configured
 - enables remote-primary mode without running `ctx setup`
 - installs coalesced session-end sync hooks for Claude, Codex, and Qwen Code
 - loads shared Hindsight memory into new Qwen Code sessions when Hindsight is installed
@@ -161,7 +164,7 @@ adapter inherited from ctx:
 
 ```bash
 export CTX_TURSO_DATABASE_URL='libsql://your-database.turso.io'
-export CTX_TURSO_AUTH_TOKEN="$(turso db tokens create your-database --expiration 1d)"
+export CTX_TURSO_AUTH_TOKEN="$(turso db tokens create your-database --expiration never)"
 
 ctx turso import --batch-size 100
 ctx turso status
@@ -174,9 +177,8 @@ and [provider documentation](docs/providers.md) for the complete current list.
 
 ## Remote-primary commands
 
-`ctx-remote` loads the installed remote configuration and obtains a short-lived
-token when needed. It is the recommended interactive and agent-facing entry
-point.
+`ctx-remote` loads the installed remote configuration and uses the configured
+database token. It is the recommended interactive and agent-facing entry point.
 
 ```bash
 ctx-remote sync-status

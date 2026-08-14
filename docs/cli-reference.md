@@ -48,6 +48,7 @@ On macOS, fork builds include an optional launchd installer:
 
 ```bash
 turso auth login
+export CTX_TURSO_AUTH_TOKEN="$(turso db tokens create your-database --expiration never)"
 scripts/install-ctx-turso-launchd.sh \
   --database-name your-database \
   --database-url libsql://your-database.turso.io
@@ -55,13 +56,15 @@ scripts/install-ctx-turso-launchd.sh \
 
 The service normally waits until provider files have been quiet for two
 minutes, but forces an idempotent import after a ten-minute maximum defer
-window so continuous agent activity cannot starve the provider. It rotates
-one-day Turso database tokens in memory and uses the macOS system CA bundle at
-`/etc/ssl/cert.pem` instead of requiring launchd keychain access. The
-installer resolves `ctx`, `turso`, and the user's home directory when it runs;
-the repository contains no username, absolute home path, or auth token. Repeat
-the installation on another Mac to merge both machines into the same
-remote-primary database.
+window so continuous agent activity cannot starve the provider. When
+`CTX_TURSO_AUTH_TOKEN` is supplied, the service uses that database token
+directly and does not require recurring Turso CLI login. The installer stores
+it only in the mode-600 sync environment file, never in the launchd plist or
+repository. Without a configured token, the service retains a compatibility
+fallback that requests one-day tokens from the logged-in Turso CLI. It uses the
+macOS system CA bundle at `/etc/ssl/cert.pem` instead of requiring launchd
+keychain access. Repeat the installation on another Mac to merge both machines
+into the same remote-primary database.
 
 The installer also places `ctx-remote` on the user path. Use it for interactive
 and agent-driven status, search, and show commands without creating a local ctx
@@ -80,8 +83,9 @@ Turso database name based on the input filename; point
 `CTX_TURSO_DATABASE_URL` at that database afterwards.
 
 - Credentials are read only from `CTX_TURSO_DATABASE_URL` and
-  `CTX_TURSO_AUTH_TOKEN`. Do not put an auth token in a command argument, a
-  config file, or a repository.
+  `CTX_TURSO_AUTH_TOKEN`. Do not put an auth token in a command argument or a
+  repository. The launchd installer may persist the environment variable in
+  its mode-600 local environment file so the background service can use it.
 - `push` reads an existing local `work.sqlite` and uploads events in bounded,
   idempotent batches. It exports only records explicitly marked `sync_full` by
   default; use `--include-local-only` to make exporting ordinary local history

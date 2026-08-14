@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  print -u2 "usage: $0 --database-name NAME --database-url libsql://HOST"
+  print -u2 "usage: CTX_TURSO_AUTH_TOKEN=... $0 --database-name NAME --database-url libsql://HOST"
 }
 
 database_name=""
@@ -88,6 +88,16 @@ readonly config_file="${config_dir}/turso-auto-sync.env"
 readonly plist_file="${launch_agents_dir}/${service_label}.plist"
 readonly launch_domain="gui/$(id -u)"
 
+auth_token="${CTX_TURSO_AUTH_TOKEN:-}"
+if [[ -z "${auth_token}" && -r "${config_file}" ]]; then
+  while IFS='=' read -r key value; do
+    if [[ "${key}" == "CTX_TURSO_AUTH_TOKEN" ]]; then
+      auth_token="${value}"
+      break
+    fi
+  done <"${config_file}"
+fi
+
 install -d -m 755 "${install_dir}" "${user_bin_dir}" "${config_dir}" "${launch_agents_dir}"
 install -m 755 "${source_script}" "${installed_script}"
 install -m 755 "${remote_source_script}" "${installed_remote_script}"
@@ -98,6 +108,7 @@ umask 077
 {
   print -r -- "CTX_TURSO_DATABASE_NAME=${database_name}"
   print -r -- "CTX_TURSO_DATABASE_URL=${database_url}"
+  [[ -z "${auth_token}" ]] || print -r -- "CTX_TURSO_AUTH_TOKEN=${auth_token}"
   print -r -- "CTX_BIN=${ctx_bin}"
   print -r -- "TURSO_BIN=${turso_bin}"
   print -r -- "CTX_TURSO_HOOK_SYNC_BIN=${installed_hook_sync_script}"
@@ -140,5 +151,9 @@ launchctl enable "${launch_domain}/${service_label}"
 print "enabled ${service_label}"
 print "remote CLI: ${installed_remote_script}"
 print "sync status: ctx-remote sync-status"
-print "credentials: short-lived token generated in memory from the logged-in Turso CLI"
+if [[ -n "${auth_token}" ]]; then
+  print "credentials: CTX_TURSO_AUTH_TOKEN stored in the protected config file"
+else
+  print "credentials: short-lived token generated from the logged-in Turso CLI"
+fi
 print "local ctx SQLite: disabled by remote-primary mode"

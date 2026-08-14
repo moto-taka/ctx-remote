@@ -13,6 +13,9 @@ if [[ -r "${CONFIG_FILE}" ]]; then
       CTX_TURSO_DATABASE_URL)
         CTX_TURSO_DATABASE_URL="${CTX_TURSO_DATABASE_URL:-${value}}"
         ;;
+      CTX_TURSO_AUTH_TOKEN)
+        CTX_TURSO_AUTH_TOKEN="${CTX_TURSO_AUTH_TOKEN:-${value}}"
+        ;;
       CTX_BIN)
         CTX_BIN="${CTX_BIN:-${value}}"
         ;;
@@ -30,6 +33,9 @@ fi
 
 CTX_BIN="${CTX_BIN:-$(command -v ctx)}"
 export CTX_TURSO_DATABASE_URL
+if [[ -n "${CTX_TURSO_AUTH_TOKEN:-}" ]]; then
+  export CTX_TURSO_AUTH_TOKEN
+fi
 
 if [[ "${1:-}" == "hook-sync" ]]; then
   [[ $# == 2 ]] || {

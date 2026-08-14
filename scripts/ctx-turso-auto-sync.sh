@@ -6,11 +6,12 @@ readonly CONFIG_FILE="${CTX_TURSO_SYNC_CONFIG:-${HOME}/.config/ctx/turso-auto-sy
 if [[ -r "${CONFIG_FILE}" ]]; then
   while IFS='=' read -r key value; do
     case "${key}" in
-      CTX_TURSO_DATABASE_NAME) CTX_TURSO_DATABASE_NAME="${value}" ;;
-      CTX_TURSO_DATABASE_URL) CTX_TURSO_DATABASE_URL="${value}" ;;
-      CTX_BIN) CTX_BIN="${value}" ;;
-      TURSO_BIN) TURSO_BIN="${value}" ;;
-      CTX_TURSO_HOOK_SYNC_BIN) CTX_TURSO_HOOK_SYNC_BIN="${value}" ;;
+      CTX_TURSO_DATABASE_NAME) CTX_TURSO_DATABASE_NAME="${CTX_TURSO_DATABASE_NAME:-${value}}" ;;
+      CTX_TURSO_DATABASE_URL) CTX_TURSO_DATABASE_URL="${CTX_TURSO_DATABASE_URL:-${value}}" ;;
+      CTX_TURSO_AUTH_TOKEN) CTX_TURSO_AUTH_TOKEN="${CTX_TURSO_AUTH_TOKEN:-${value}}" ;;
+      CTX_BIN) CTX_BIN="${CTX_BIN:-${value}}" ;;
+      TURSO_BIN) TURSO_BIN="${TURSO_BIN:-${value}}" ;;
+      CTX_TURSO_HOOK_SYNC_BIN) CTX_TURSO_HOOK_SYNC_BIN="${CTX_TURSO_HOOK_SYNC_BIN:-${value}}" ;;
     esac
   done <"${CONFIG_FILE}"
 fi
@@ -28,6 +29,11 @@ BATCH_SIZE="${CTX_TURSO_BATCH_SIZE:-250}"
 STATE_DIR="${CTX_TURSO_STATE_DIR:-${HOME}/.local/state/ctx-remote}"
 STATUS_FILE="${CTX_TURSO_STATUS_FILE:-${STATE_DIR}/sync-status.env}"
 CTX_TURSO_HOOK_SYNC_BIN="${CTX_TURSO_HOOK_SYNC_BIN:-${HOME}/.local/libexec/ctx/ctx-remote-hook-sync}"
+token_is_configured=0
+if [[ -n "${CTX_TURSO_AUTH_TOKEN:-}" ]]; then
+  token_is_configured=1
+  export CTX_TURSO_AUTH_TOKEN
+fi
 
 export CTX_TURSO_DATABASE_URL
 if [[ -z "${SSL_CERT_FILE:-}" && -r /etc/ssl/cert.pem ]]; then
@@ -40,19 +46,58 @@ cycle_sources_synced=0
 cycle_uploaded_events=0
 cycle_scanned_events=0
 cycle_last_error=""
+cycle_token_refreshes=0
 
 refresh_token() {
-  local now token
+  local force="${1:-0}"
+  local now token auth_error error_file error_summary
   now="$(date +%s)"
-  if (( now - token_issued_at < TOKEN_REFRESH_SECONDS )) && [[ -n "${CTX_TURSO_AUTH_TOKEN:-}" ]]; then
+  if (( token_is_configured == 1 )); then
+    token_issued_at="${now}"
+    return 0
+  fi
+  if (( force == 0 && now - token_issued_at < TOKEN_REFRESH_SECONDS )) &&
+    [[ -n "${CTX_TURSO_AUTH_TOKEN:-}" ]]; then
     return 0
   fi
 
-  token="$("${TURSO_BIN}" db tokens create "${CTX_TURSO_DATABASE_NAME}" --expiration 1d 2>/dev/null)" ||
+  if ! auth_error="$("${TURSO_BIN}" auth whoami 2>&1)"; then
+    auth_error="${auth_error//$'\n'/ }"
+    cycle_last_error="Turso CLI authentication failed: ${auth_error[1,500]}"
     return 1
-  [[ -n "${token}" ]] || return 1
+  fi
+  if [[ "${auth_error:l}" == *"not logged in"* || "${auth_error:l}" == *"please login"* ]]; then
+    auth_error="${auth_error//$'\n'/ }"
+    cycle_last_error="Turso CLI authentication failed: ${auth_error[1,500]}"
+    return 1
+  fi
+  mkdir -p "${STATE_DIR}" || return 1
+  error_file="${STATE_DIR}/token-error.tmp.$$"
+  if ! token="$("${TURSO_BIN}" db tokens create "${CTX_TURSO_DATABASE_NAME}" --expiration 1d 2>"${error_file}")"; then
+    error_summary="$(<"${error_file}")"
+    error_summary="${error_summary//$'\n'/ }"
+    cycle_last_error="Turso token refresh failed: ${error_summary[1,500]}"
+    rm -f "${error_file}"
+    return 1
+  fi
+  rm -f "${error_file}"
+  if [[ -z "${token}" ]]; then
+    cycle_last_error="Turso token refresh returned an empty token"
+    return 1
+  fi
   export CTX_TURSO_AUTH_TOKEN="${token}"
   token_issued_at="${now}"
+}
+
+invalidate_token() {
+  (( token_is_configured == 1 )) && return 0
+  token_issued_at=0
+  unset CTX_TURSO_AUTH_TOKEN
+}
+
+is_auth_failure() {
+  local error_file="$1"
+  grep -Eqi 'invalidtoken|jwt error|unauthorized|authentication failed|status[=:]401' "${error_file}"
 }
 
 source_is_quiet() {
@@ -125,17 +170,37 @@ sync_source() {
   source_is_ready "${label}" "${source_path}" || return 0
   mkdir -p "${STATE_DIR}" || return 1
   error_file="${STATE_DIR}/sync-error.tmp.$$"
-  report="$("${CTX_TURSO_HOOK_SYNC_BIN}" locked-exec "${CTX_BIN}" --quiet turso import \
-    --provider "${provider}" \
-    --path "${source_path}" \
-    --batch-size "${BATCH_SIZE}" \
-    --json 2>"${error_file}")"
-  command_status=$?
-  if (( command_status == 75 )); then
-    rm -f "${error_file}"
-    return 0
-  fi
-  if (( command_status != 0 )); then
+  while true; do
+    report="$("${CTX_TURSO_HOOK_SYNC_BIN}" locked-exec "${CTX_BIN}" --quiet turso import \
+      --provider "${provider}" \
+      --path "${source_path}" \
+      --batch-size "${BATCH_SIZE}" \
+      --json 2>"${error_file}")"
+    command_status=$?
+    if (( command_status == 75 )); then
+      rm -f "${error_file}"
+      return 0
+    fi
+    if (( command_status == 0 )); then
+      rm -f "${error_file}"
+      uploaded="$(json_metric "${report}" "uploaded_events")"
+      scanned="$(json_metric "${report}" "scanned_events")"
+      (( cycle_sources_synced += 1 ))
+      (( cycle_uploaded_events += uploaded ))
+      (( cycle_scanned_events += scanned ))
+      last_sync_epoch[${label}]="$(date +%s)"
+      write_status "running" 0 ||
+        logger -t ctx-turso-sync -- "could not update sync status"
+      return 0
+    fi
+    if (( token_is_configured == 0 && cycle_token_refreshes == 0 )) &&
+      is_auth_failure "${error_file}"; then
+      cycle_token_refreshes=1
+      invalidate_token
+      if refresh_token 1; then
+        continue
+      fi
+    fi
     error_summary="$(<"${error_file}")"
     error_summary="${error_summary//$'\n'/ }"
     error_summary="${error_summary//=/:}"
@@ -143,16 +208,7 @@ sync_source() {
     rm -f "${error_file}"
     logger -t ctx-turso-sync -- "${label} sync failed; retrying next cycle"
     return 1
-  fi
-  rm -f "${error_file}"
-  uploaded="$(json_metric "${report}" "uploaded_events")"
-  scanned="$(json_metric "${report}" "scanned_events")"
-  (( cycle_sources_synced += 1 ))
-  (( cycle_uploaded_events += uploaded ))
-  (( cycle_scanned_events += scanned ))
-  last_sync_epoch[${label}]="$(date +%s)"
-  write_status "running" 0 ||
-    logger -t ctx-turso-sync -- "could not update sync status"
+  done
 }
 
 while true; do
@@ -160,10 +216,14 @@ while true; do
   cycle_uploaded_events=0
   cycle_scanned_events=0
   cycle_last_error=""
+  cycle_token_refreshes=0
   if ! refresh_token; then
     logger -t ctx-turso-sync -- "could not issue a short-lived Turso token; retrying"
     write_status "error" 1 ||
       logger -t ctx-turso-sync -- "could not update sync status"
+    if [[ "${CTX_TURSO_SYNC_ONCE:-0}" == "1" ]]; then
+      exit 1
+    fi
     sleep "${SYNC_INTERVAL_SECONDS}"
     continue
   fi
